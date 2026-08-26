@@ -25,6 +25,14 @@ tokio-postgres = { version = "0.7.18", features = ["with-serde_json-1"] }
 tokio-postgres-rustls = { version = "0.14.0", features = ["ring", "webpki-roots"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+argon2 = "0.5.3"
+rand = "0.10.2"
+rsa = "0.9.10"
+pkcs8 = "0.11.0"
+base64 = "0.23.1"
+url = "2.5.8"
+uuid = "1.25.0"
+axum-extra = { version = "0.12.6", features = ["cookie", "typed-header"] }
 
 [profile.release]
 codegen-units = 1
