@@ -1,0 +1,34 @@
+[package]
+name = "aprendiendo-mcp"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+description = "Project-scoped MCP server for the Aprendiendo Espanol ChatGPT project"
+
+[dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
+axum = "0.8"
+deadpool-postgres = "0.14.1"
+dotenvy = "0.15"
+jsonwebtoken = { version = "11.0.0", default-features = false, features = ["rust_crypto"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+rmcp = { version = "3.1.4", default-features = false, features = ["macros", "server", "transport-streamable-http-server"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+schemars = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.47", features = ["macros", "net", "rt-multi-thread", "signal", "time"] }
+tokio-util = "0.7"
+tokio-postgres = { version = "0.7.18", features = ["with-serde_json-1"] }
+tokio-postgres-rustls = { version = "0.14.0", features = ["ring", "webpki-roots"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+opt-level = "z"
+panic = "abort"
+strip = true

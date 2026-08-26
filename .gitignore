@@ -1,0 +1,11 @@
+/target/
+/.env
+*.exe
+
+# Local configuration and generated credentials
+.env.*
+!.env.example
+
+# Local build/debug output
+*.pdb
+*.dSYM/

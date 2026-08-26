@@ -1,0 +1,20 @@
+# Aprendiendo MCP — Caddy reverse proxy (TLS termination).
+#
+# Caddy obtains and renews a Let's Encrypt certificate automatically. Run it
+# with the domain exported, e.g.:
+#
+#   DOMAIN=spanish.example.com caddy run --config deploy/Caddyfile
+#
+# The application container binds to 127.0.0.1:8080 on the host (compose.yaml),
+# so this proxy stays loopback-to-loopback and never exposes 8080 publicly.
+
+{$DOMAIN} {
+    encode zstd gzip
+
+    reverse_proxy 127.0.0.1:8080
+
+    header {
+        -Server
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+    }
+}
