@@ -3,8 +3,6 @@ services:
     build: .
     restart: unless-stopped
     env_file: .env
-    ports:
-      - "127.0.0.1:8080:8080"
     mem_limit: 96m
     read_only: true
     tmpfs:
@@ -14,3 +12,23 @@ services:
     security_opt:
       - no-new-privileges:true
 
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      - PUBLIC_DOMAIN=${PUBLIC_DOMAIN:-localhost}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    cap_add:
+      - NET_BIND_SERVICE
+    depends_on:
+      - mcp
+
+volumes:
+  caddy_data:
+  caddy_config:

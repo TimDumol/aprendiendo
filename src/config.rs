@@ -17,6 +17,7 @@ pub enum AuthConfig {
     Disabled,
     Oidc(OidcConfig),
     Bearer(String),
+    EmbeddedOauth(EmbeddedOauthConfig),
 }
 
 #[derive(Clone, Debug)]
@@ -26,6 +27,17 @@ pub struct OidcConfig {
     pub jwks_url: String,
     pub audience: String,
     pub allowed_subject: String,
+    pub required_scope: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct EmbeddedOauthConfig {
+    pub public_base_url: String,
+    pub username: String,
+    pub password_hash: String,
+    pub rsa_private_key_path: String,
+    pub client_id: String,
+    pub redirect_uri: String,
     pub required_scope: String,
 }
 
@@ -70,7 +82,18 @@ impl Config {
                 }
                 AuthConfig::Bearer(token)
             }
-            other => bail!("unsupported AUTH_MODE {other:?}; expected oidc, bearer, or disabled"),
+            "embedded_oauth" => {
+                AuthConfig::EmbeddedOauth(EmbeddedOauthConfig {
+                    public_base_url: trim_trailing_slash(required("PUBLIC_BASE_URL")?),
+                    username: required("OAUTH_USERNAME")?,
+                    password_hash: required("OAUTH_PASSWORD_HASH")?,
+                    rsa_private_key_path: required("OAUTH_RSA_KEY_PATH")?,
+                    client_id: required("OAUTH_CLIENT_ID")?,
+                    redirect_uri: required("OAUTH_REDIRECT_URI")?,
+                    required_scope: env_or("OIDC_REQUIRED_SCOPE", "learning:access"),
+                })
+            }
+            other => bail!("unsupported AUTH_MODE {other:?}; expected oidc, bearer, embedded_oauth, or disabled"),
         };
 
         Ok(Self {
