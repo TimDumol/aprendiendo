@@ -46,6 +46,7 @@ async fn main() -> Result<()> {
     store.ping().await.context("initial database ping failed")?;
     let oauth_scope = match &config.auth {
         aprendiendo_mcp::config::AuthConfig::Oidc(oidc) => Some(oidc.required_scope.clone()),
+        aprendiendo_mcp::config::AuthConfig::EmbeddedOauth(embed) => Some(embed.required_scope.clone()),
         aprendiendo_mcp::config::AuthConfig::Disabled => None,
         aprendiendo_mcp::config::AuthConfig::Bearer(_) => None,
     };
@@ -69,20 +70,41 @@ async fn main() -> Result<()> {
         .nest_service("/mcp", mcp_service)
         .layer(DefaultBodyLimit::max(config.max_request_bytes))
         .layer(middleware::from_fn_with_state(auth.clone(), require_auth));
+
     let auth_routes = Router::new()
         .route("/health", get(health))
         .route(
             "/.well-known/oauth-protected-resource",
             get(protected_resource_metadata),
         )
-        .with_state(auth);
-    let readiness_route = Router::new()
-        .route("/ready", get(readiness))
-        .with_state(AppState { store });
-    let app = Router::new()
+        .with_state(auth.clone());
+
+    let mut app = Router::new()
         .merge(auth_routes)
-        .merge(readiness_route)
+        .route("/ready", get(readiness).with_state(AppState { store }))
         .merge(protected);
+
+    if let Authenticator::EmbeddedOauth(config_arc, state) = auth {
+        let oauth_routes = Router::new()
+            .route(
+                "/.well-known/oauth-authorization-server",
+                get(aprendiendo_mcp::embedded_oauth::authorization_server_metadata).with_state(config_arc.clone()),
+            )
+            .route(
+                "/oauth/jwks",
+                get(aprendiendo_mcp::embedded_oauth::jwks).with_state(state.clone()),
+            )
+            .route(
+                "/oauth/authorize",
+                get(aprendiendo_mcp::embedded_oauth::authorize_get).with_state(config_arc)
+                    .post(aprendiendo_mcp::embedded_oauth::authorize_post).with_state(state.clone()),
+            )
+            .route(
+                "/oauth/token",
+                axum::routing::post(aprendiendo_mcp::embedded_oauth::token_post).with_state(state.clone()),
+            );
+        app = app.merge(oauth_routes);
+    }
 
     let listener = tokio::net::TcpListener::bind(config.bind_addr)
         .await
