@@ -14,6 +14,7 @@ use axum::{
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header, jwk::JwkSet};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
+use tracing::{info, warn};
 
 use crate::config::{AuthConfig, OidcConfig};
 
@@ -58,7 +59,10 @@ impl Authenticator {
             AuthConfig::EmbeddedOauth(config) => {
                 let config_arc = Arc::new(config.clone());
                 let state = crate::embedded_oauth::EmbeddedOauthState::new(config_arc.clone())?;
-                Ok(Self::EmbeddedOauth(config_arc, Arc::new(tokio::sync::Mutex::new(state))))
+                Ok(Self::EmbeddedOauth(
+                    config_arc,
+                    Arc::new(tokio::sync::Mutex::new(state)),
+                ))
             }
             AuthConfig::Oidc(config) => {
                 let client = reqwest::Client::builder()
@@ -86,13 +90,11 @@ impl Authenticator {
                 authorization_servers: vec![auth.config.issuer.clone()],
                 scopes_supported: vec![auth.config.required_scope.clone()],
             }),
-            Self::EmbeddedOauth(config, _) => {
-                Some(ProtectedResourceMetadata {
-                    resource: config.public_base_url.clone(),
-                    authorization_servers: vec![config.public_base_url.clone()],
-                    scopes_supported: vec![config.required_scope.clone()],
-                })
-            },
+            Self::EmbeddedOauth(config, _) => Some(ProtectedResourceMetadata {
+                resource: config.public_base_url.clone(),
+                authorization_servers: vec![config.public_base_url.clone()],
+                scopes_supported: vec![config.required_scope.clone()],
+            }),
             _ => None,
         }
     }
@@ -103,12 +105,10 @@ impl Authenticator {
                 "Bearer resource_metadata=\"{}/.well-known/oauth-protected-resource\", scope=\"{}\"",
                 auth.config.public_base_url, auth.config.required_scope
             )),
-            Self::EmbeddedOauth(config, _) => {
-                Some(format!(
-                    "Bearer resource_metadata=\"{}/.well-known/oauth-protected-resource\", scope=\"{}\"",
-                    config.public_base_url, config.required_scope
-                ))
-            },
+            Self::EmbeddedOauth(config, _) => Some(format!(
+                "Bearer resource_metadata=\"{}/.well-known/oauth-protected-resource\", scope=\"{}\"",
+                config.public_base_url, config.required_scope
+            )),
             Self::Bearer(_) => Some("Bearer".to_string()),
             Self::Disabled => None,
         }
@@ -178,8 +178,9 @@ impl Authenticator {
                         *last_refresh = Instant::now();
                     }
                 }
-                let key = DecodingKey::from_jwk(jwk.as_ref().context("JWT signing key is unknown")?)
-                    .context("invalid JWK")?;
+                let key =
+                    DecodingKey::from_jwk(jwk.as_ref().context("JWT signing key is unknown")?)
+                        .context("invalid JWK")?;
                 let mut validation = Validation::new(header.alg);
                 validation.set_issuer(&[&auth.config.issuer]);
                 validation.set_audience(&[&auth.config.audience]);
@@ -225,15 +226,25 @@ pub async fn require_auth(
     if matches!(auth, Authenticator::Disabled) {
         return next.run(request).await;
     }
+    let path = request.uri().path().to_owned();
     let token = request
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "));
-    if let Some(token) = token
-        && auth.verify(token).await.is_ok()
-    {
-        return next.run(request).await;
+    match token {
+        Some(token) => match auth.verify(token).await {
+            Ok(()) => {
+                info!(path, "bearer token accepted");
+                return next.run(request).await;
+            }
+            Err(error) => warn!(path, reason = %error, "bearer token rejected"),
+        },
+        None => warn!(
+            path,
+            reason = "missing_or_malformed",
+            "bearer token rejected"
+        ),
     }
     let mut response = (StatusCode::UNAUTHORIZED, "authentication required").into_response();
     if let Some(challenge) = auth.challenge()

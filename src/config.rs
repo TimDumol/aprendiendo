@@ -5,8 +5,7 @@ use anyhow::{Context, Result, bail};
 #[derive(Clone, Debug)]
 pub struct Config {
     pub bind_addr: SocketAddr,
-    pub database_url: String,
-    pub database_pool_size: usize,
+    pub database_path: String,
     pub database_timeout: Duration,
     pub max_request_bytes: usize,
     pub auth: AuthConfig,
@@ -46,14 +45,10 @@ impl Config {
         let bind_addr = env_or("BIND_ADDR", "127.0.0.1:8080")
             .parse::<SocketAddr>()
             .context("BIND_ADDR must be a socket address such as 127.0.0.1:8080")?;
-        let database_url = required("DATABASE_URL")?;
-        let database_pool_size = parse_or("DATABASE_POOL_SIZE", 2usize)?;
+        let database_path = env_or("DATABASE_PATH", "data/aprendiendo.sqlite3");
         let database_timeout_seconds = parse_or("DATABASE_TIMEOUT_SECONDS", 10u64)?;
         let max_request_bytes = parse_or("MAX_REQUEST_BYTES", 131_072usize)?;
 
-        if database_pool_size == 0 || database_pool_size > 8 {
-            bail!("DATABASE_POOL_SIZE must be between 1 and 8");
-        }
         let auth = match env_or("AUTH_MODE", "oidc").as_str() {
             "oidc" => {
                 let public_base_url = trim_trailing_slash(required("PUBLIC_BASE_URL")?);
@@ -78,28 +73,29 @@ impl Config {
             "bearer" => {
                 let token = required("BEARER_TOKEN")?;
                 if token.len() < 32 {
-                    bail!("BEARER_TOKEN must be at least 32 characters; generate one with `openssl rand -base64 32`");
+                    bail!(
+                        "BEARER_TOKEN must be at least 32 characters; generate one with `openssl rand -base64 32`"
+                    );
                 }
                 AuthConfig::Bearer(token)
             }
-            "embedded_oauth" => {
-                AuthConfig::EmbeddedOauth(EmbeddedOauthConfig {
-                    public_base_url: trim_trailing_slash(required("PUBLIC_BASE_URL")?),
-                    username: required("OAUTH_USERNAME")?,
-                    password_hash: required("OAUTH_PASSWORD_HASH")?,
-                    rsa_private_key_path: required("OAUTH_RSA_KEY_PATH")?,
-                    client_id: required("OAUTH_CLIENT_ID")?,
-                    redirect_uri: required("OAUTH_REDIRECT_URI")?,
-                    required_scope: env_or("OIDC_REQUIRED_SCOPE", "learning:access"),
-                })
-            }
-            other => bail!("unsupported AUTH_MODE {other:?}; expected oidc, bearer, embedded_oauth, or disabled"),
+            "embedded_oauth" => AuthConfig::EmbeddedOauth(EmbeddedOauthConfig {
+                public_base_url: trim_trailing_slash(required("PUBLIC_BASE_URL")?),
+                username: required("OAUTH_USERNAME")?,
+                password_hash: required("OAUTH_PASSWORD_HASH")?,
+                rsa_private_key_path: required("OAUTH_RSA_KEY_PATH")?,
+                client_id: required("OAUTH_CLIENT_ID")?,
+                redirect_uri: required("OAUTH_REDIRECT_URI")?,
+                required_scope: env_or("OIDC_REQUIRED_SCOPE", "learning:access"),
+            }),
+            other => bail!(
+                "unsupported AUTH_MODE {other:?}; expected oidc, bearer, embedded_oauth, or disabled"
+            ),
         };
 
         Ok(Self {
             bind_addr,
-            database_url,
-            database_pool_size,
+            database_path,
             database_timeout: Duration::from_secs(database_timeout_seconds),
             max_request_bytes,
             auth,

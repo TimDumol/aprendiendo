@@ -1,0 +1,7 @@
+all:
+  children:
+    mcp:
+      hosts:
+        mars:
+          ansible_host: 2.29.6.134
+          ansible_user: timdumol

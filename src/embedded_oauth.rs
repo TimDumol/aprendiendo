@@ -1,14 +1,10 @@
-use std::{
-    collections::HashMap,
-    sync::Arc,
-    time::Instant,
-};
-use tokio::sync::Mutex;
-use jsonwebtoken::jwk::Jwk;
-use rsa::{RsaPrivateKey, pkcs8::DecodePrivateKey, traits::PublicKeyParts};
 use crate::config::EmbeddedOauthConfig;
 use anyhow::{Context, Result};
+use jsonwebtoken::jwk::Jwk;
+use rsa::{RsaPrivateKey, pkcs8::DecodePrivateKey, traits::PublicKeyParts};
 use std::fs;
+use std::{collections::HashMap, sync::Arc, time::Instant};
+use tokio::sync::Mutex;
 
 #[derive(Clone, Debug)]
 pub struct AuthCode {
@@ -31,8 +27,8 @@ impl EmbeddedOauthState {
     pub fn new(config: Arc<EmbeddedOauthConfig>) -> Result<Self> {
         let pem = fs::read_to_string(&config.rsa_private_key_path)
             .context("failed to read OAUTH_RSA_KEY_PATH")?;
-        let rsa_private_key = RsaPrivateKey::from_pkcs8_pem(&pem)
-            .context("failed to parse RSA private key")?;
+        let rsa_private_key =
+            RsaPrivateKey::from_pkcs8_pem(&pem).context("failed to parse RSA private key")?;
 
         let jwk = Jwk {
             common: jsonwebtoken::jwk::CommonParameters {
@@ -56,8 +52,8 @@ impl EmbeddedOauthState {
                         &base64::engine::general_purpose::URL_SAFE_NO_PAD,
                         rsa_private_key.e().to_bytes_be(),
                     ),
-                }
-            )
+                },
+            ),
         };
 
         Ok(Self {
@@ -71,7 +67,7 @@ impl EmbeddedOauthState {
 
 pub type SharedOauthState = Arc<Mutex<EmbeddedOauthState>>;
 
-use axum::{Json, extract::State, response::IntoResponse, http::StatusCode};
+use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
 use serde_json::json;
 
 pub async fn authorization_server_metadata(
@@ -79,6 +75,7 @@ pub async fn authorization_server_metadata(
 ) -> impl IntoResponse {
     let metadata = json!({
         "issuer": config.public_base_url,
+        "authorization_response_iss_parameter_supported": true,
         "authorization_endpoint": format!("{}/oauth/authorize", config.public_base_url),
         "token_endpoint": format!("{}/oauth/token", config.public_base_url),
         "jwks_uri": format!("{}/oauth/jwks", config.public_base_url),
@@ -86,7 +83,7 @@ pub async fn authorization_server_metadata(
         "response_types_supported": ["code"],
         "grant_types_supported": ["authorization_code"],
         "code_challenge_methods_supported": ["S256"],
-        "token_endpoint_auth_methods_supported": ["none", "client_secret_post", "client_secret_basic"],
+        "token_endpoint_auth_methods_supported": ["none"],
     });
     (StatusCode::OK, Json(metadata))
 }
@@ -96,14 +93,15 @@ pub async fn jwks(State(state): State<SharedOauthState>) -> impl IntoResponse {
     (StatusCode::OK, Json(json!({ "keys": [jwk] })))
 }
 
+use argon2::{Argon2, PasswordHash, PasswordVerifier};
 use axum::{
-    extract::{Query, Form},
+    extract::{Form, Query},
     response::{Html, Redirect, Response},
 };
 use axum_extra::extract::cookie::{Cookie, CookieJar};
 use serde::Deserialize;
+use tracing::{info, warn};
 use uuid::Uuid;
-use argon2::{Argon2, PasswordHash, PasswordVerifier};
 
 #[derive(Deserialize, Debug)]
 pub struct AuthorizeQuery {
@@ -129,7 +127,6 @@ pub async fn authorize_get(
     jar: CookieJar,
     Query(query): Query<AuthorizeQuery>,
 ) -> Result<(CookieJar, Html<String>), Response> {
-
     if query.client_id != config.client_id || query.redirect_uri != config.redirect_uri {
         return Err((StatusCode::BAD_REQUEST, "invalid client_id or redirect_uri").into_response());
     }
@@ -139,7 +136,11 @@ pub async fn authorize_get(
     if query.code_challenge_method != "S256" {
         return Err((StatusCode::BAD_REQUEST, "unsupported code_challenge_method").into_response());
     }
-    if !query.scope.split_ascii_whitespace().any(|sc| sc == config.required_scope) {
+    if !query
+        .scope
+        .split_ascii_whitespace()
+        .any(|sc| sc == config.required_scope)
+    {
         return Err((StatusCode::BAD_REQUEST, "invalid scope").into_response());
     }
 
@@ -151,7 +152,8 @@ pub async fn authorize_get(
         .same_site(axum_extra::extract::cookie::SameSite::Lax)
         .build();
 
-    let html = format!(r#"<!DOCTYPE html>
+    let html = format!(
+        r#"<!DOCTYPE html>
 <html>
 <head><title>Authorize</title></head>
 <body>
@@ -170,7 +172,9 @@ pub async fn authorize_get(
   <button type="submit" name="action" value="deny" formnovalidate>Deny</button>
 </form>
 </body>
-</html>"#, csrf_token = csrf_token);
+</html>"#,
+        csrf_token = csrf_token
+    );
 
     Ok((jar.add(cookie), Html(html)))
 }
@@ -183,17 +187,26 @@ pub async fn authorize_post(
 ) -> Result<Response, Response> {
     let expected_csrf = jar.get("csrf_token").map(|c| c.value().to_string());
     if expected_csrf.is_none() || expected_csrf.as_deref() != Some(&form.csrf_token) {
+        warn!(reason = "csrf_mismatch", "authorization request rejected");
         return Err((StatusCode::FORBIDDEN, "invalid CSRF token").into_response());
     }
 
     let mut s = state.lock().await;
 
     if query.client_id != s.config.client_id || query.redirect_uri != s.config.redirect_uri {
+        warn!(
+            reason = "client_or_redirect_mismatch",
+            "authorization request rejected"
+        );
         return Err((StatusCode::BAD_REQUEST, "invalid client_id or redirect_uri").into_response());
     }
 
     if form.action == "deny" {
-        let mut redirect = format!("{}?error=access_denied", query.redirect_uri);
+        info!("authorization request denied by user");
+        let mut redirect = format!(
+            "{}?error=access_denied&iss={}",
+            query.redirect_uri, s.config.public_base_url
+        );
         if let Some(st) = query.state {
             redirect.push_str(&format!("&state={}", st));
         }
@@ -207,27 +220,41 @@ pub async fn authorize_post(
     let parsed_hash_result = PasswordHash::new(&s.config.password_hash);
 
     let password_ok = match parsed_hash_result {
-        Ok(parsed_hash) => Argon2::default().verify_password(password.as_bytes(), &parsed_hash).is_ok(),
+        Ok(parsed_hash) => Argon2::default()
+            .verify_password(password.as_bytes(), &parsed_hash)
+            .is_ok(),
         Err(_) => false,
     };
 
     if !username_ok || !password_ok {
+        warn!(
+            username_matches = username_ok,
+            password_matches = password_ok,
+            "authorization credentials rejected"
+        );
         tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
         return Err((StatusCode::UNAUTHORIZED, "invalid username or password").into_response());
     }
 
     let code = Uuid::new_v4().to_string();
 
-    s.auth_codes.insert(code.clone(), AuthCode {
-        code: code.clone(),
-        client_id: query.client_id,
-        redirect_uri: query.redirect_uri.clone(),
-        code_challenge: query.code_challenge,
-        code_challenge_method: query.code_challenge_method,
-        expires_at: std::time::Instant::now() + std::time::Duration::from_secs(300),
-    });
+    s.auth_codes.insert(
+        code.clone(),
+        AuthCode {
+            code: code.clone(),
+            client_id: query.client_id,
+            redirect_uri: query.redirect_uri.clone(),
+            code_challenge: query.code_challenge,
+            code_challenge_method: query.code_challenge_method,
+            expires_at: std::time::Instant::now() + std::time::Duration::from_secs(300),
+        },
+    );
+    info!("authorization code issued");
 
-    let mut redirect = format!("{}?code={}", query.redirect_uri, code);
+    let mut redirect = format!(
+        "{}?code={}&iss={}",
+        query.redirect_uri, code, s.config.public_base_url
+    );
     if let Some(st) = query.state {
         redirect.push_str(&format!("&state={}", st));
     }
@@ -237,9 +264,9 @@ pub async fn authorize_post(
     Ok((jar, Redirect::to(&redirect)).into_response())
 }
 
+use jsonwebtoken::{EncodingKey, Header, encode};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use jsonwebtoken::{encode, EncodingKey, Header};
 
 #[derive(Deserialize, Debug)]
 pub struct TokenRequest {
@@ -272,37 +299,67 @@ pub async fn token_post(
     Form(req): Form<TokenRequest>,
 ) -> impl IntoResponse {
     if req.grant_type != "authorization_code" {
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": "unsupported_grant_type"}))).into_response();
+        warn!(reason = "unsupported_grant_type", "token request rejected");
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "unsupported_grant_type"})),
+        )
+            .into_response();
     }
 
     let mut s = state.lock().await;
 
     // cleanup expired codes
-    s.auth_codes.retain(|_, v| v.expires_at > std::time::Instant::now());
+    s.auth_codes
+        .retain(|_, v| v.expires_at > std::time::Instant::now());
 
     let auth_code = match s.auth_codes.remove(&req.code) {
         Some(c) => c,
-        None => return (StatusCode::BAD_REQUEST, Json(json!({"error": "invalid_grant"}))).into_response(),
+        None => {
+            warn!(reason = "unknown_or_expired_code", "token request rejected");
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "invalid_grant"})),
+            )
+                .into_response();
+        }
     };
 
     if auth_code.client_id != req.client_id || auth_code.redirect_uri != req.redirect_uri {
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": "invalid_grant"}))).into_response();
+        warn!(
+            reason = "client_or_redirect_mismatch",
+            "token request rejected"
+        );
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "invalid_grant"})),
+        )
+            .into_response();
     }
 
     let mut hasher = Sha256::new();
     hasher.update(req.code_verifier.as_bytes());
     let hash = hasher.finalize();
-    let expected_challenge = base64::Engine::encode(
-        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
-        hash,
-    );
+    let expected_challenge =
+        base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, hash);
 
     if auth_code.code_challenge != expected_challenge {
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": "invalid_grant"}))).into_response();
+        warn!(
+            reason = "pkce_verification_failed",
+            "token request rejected"
+        );
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "invalid_grant"})),
+        )
+            .into_response();
     }
 
     // Generate JWT
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
     let expires_in = 3600;
 
     let claims = JwtClaims {
@@ -316,9 +373,10 @@ pub async fn token_post(
     let mut header = Header::new(jsonwebtoken::Algorithm::RS256);
     header.kid = Some("1".to_string());
 
-    let pem = std::fs::read_to_string(&s.config.rsa_private_key_path).expect("failed to read private key");
-    let encoding_key = EncodingKey::from_rsa_pem(pem.as_bytes())
-        .expect("failed to create encoding key from pem");
+    let pem = std::fs::read_to_string(&s.config.rsa_private_key_path)
+        .expect("failed to read private key");
+    let encoding_key =
+        EncodingKey::from_rsa_pem(pem.as_bytes()).expect("failed to create encoding key from pem");
 
     let token = encode(&header, &claims, &encoding_key).expect("failed to sign token");
 
@@ -328,6 +386,8 @@ pub async fn token_post(
         expires_in,
         scope: s.config.required_scope.clone(),
     };
+
+    info!(expires_in, "access token issued");
 
     (StatusCode::OK, Json(response)).into_response()
 }

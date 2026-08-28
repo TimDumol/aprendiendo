@@ -1,11 +1,20 @@
 /target/
 /.env
+/.neon-db-url
 *.exe
 
 # Local configuration and generated credentials
 .env.*
 !.env.example
+/deploy/ansible/inventory/hosts.yml
+/deploy/ansible/group_vars/mcp/secrets.yml
 
 # Local build/debug output
 *.pdb
 *.dSYM/
+
+# Runtime database (the exported seed is tracked separately).
+data/*.sqlite3
+data/*.sqlite3-shm
+data/*.sqlite3-wal
+/data/

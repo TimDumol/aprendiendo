@@ -1,0 +1,1 @@
+- To release: `scripts/release.sh`

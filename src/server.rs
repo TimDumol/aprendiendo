@@ -179,7 +179,7 @@ impl LearningServer {
             .map_err(|err| Self::tool_error("record_practice_session", err))
     }
 
-    /// Fetch active weaknesses prioritized by incorrect observations and error rate.
+    /// Fetch active weaknesses prioritized by due date and historical error rate.
     #[tool(
         name = "get_review_queue",
         annotations(
@@ -198,14 +198,20 @@ impl LearningServer {
             return Err("limit must be between 1 and 50".into());
         }
         Self::validate_optional_text(request.category.as_deref(), "category", 80)?;
+        Self::validate_optional_text(request.as_of.as_deref(), "as_of", 10)?;
         self.store
-            .review_queue(limit.into(), request.category.as_deref())
+            .review_queue(
+                limit.into(),
+                request.category.as_deref(),
+                request.as_of.as_deref(),
+                request.include_upcoming.unwrap_or(false),
+            )
             .await
             .map(Self::domain)
             .map_err(|err| Self::tool_error("get_review_queue", err))
     }
 
-    /// Create a weakness or update its category, description, target pattern, and active state.
+    /// Create a due-now weakness or update its description, target pattern, and active state.
     #[tool(
         name = "upsert_weakness",
         annotations(

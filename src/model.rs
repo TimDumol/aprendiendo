@@ -21,13 +21,17 @@ pub struct RecentPracticeRequest {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ReviewQueueRequest {
-    /// Maximum number of active weaknesses to return. Range: 1-50.
+    /// Maximum number of weaknesses to return. Range: 1-50.
     pub limit: Option<u16>,
     /// Optional weakness category filter.
     pub category: Option<String>,
+    /// Review date in YYYY-MM-DD form; defaults to the database's current date.
+    pub as_of: Option<String>,
+    /// Include scheduled future reviews after due items. Defaults to false.
+    pub include_upcoming: Option<bool>,
 }
 
-#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ObservationOutcome {
     Incorrect,

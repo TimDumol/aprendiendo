@@ -102,9 +102,12 @@ async fn streamable_http_lists_and_calls_six_domain_tools() {
 
 use aprendiendo_mcp::config::EmbeddedOauthConfig;
 use aprendiendo_mcp::embedded_oauth::EmbeddedOauthState;
-use argon2::{password_hash::{rand_core::OsRng, PasswordHasher, SaltString}, Argon2};
-use std::fs;
+use argon2::{
+    Argon2,
+    password_hash::{PasswordHasher, SaltString, rand_core::OsRng},
+};
 use rsa::{RsaPrivateKey, pkcs8::EncodePrivateKey};
+use std::fs;
 
 async fn setup_embedded_oauth_app() -> (String, reqwest::Client, tokio::task::JoinHandle<()>) {
     let rsa_key = RsaPrivateKey::new(&mut OsRng, 2048).expect("failed to generate key");
@@ -113,7 +116,10 @@ async fn setup_embedded_oauth_app() -> (String, reqwest::Client, tokio::task::Jo
 
     let password = "test_password";
     let salt = SaltString::generate(&mut OsRng);
-    let password_hash = Argon2::default().hash_password(password.as_bytes(), &salt).unwrap().to_string();
+    let password_hash = Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
+        .unwrap()
+        .to_string();
 
     let config = EmbeddedOauthConfig {
         public_base_url: "http://localhost".to_string(),
@@ -126,13 +132,32 @@ async fn setup_embedded_oauth_app() -> (String, reqwest::Client, tokio::task::Jo
     };
 
     let config_arc = Arc::new(config);
-    let state = Arc::new(tokio::sync::Mutex::new(EmbeddedOauthState::new(config_arc.clone()).unwrap()));
+    let state = Arc::new(tokio::sync::Mutex::new(
+        EmbeddedOauthState::new(config_arc.clone()).unwrap(),
+    ));
 
     let app = Router::new()
-        .route("/.well-known/oauth-authorization-server", axum::routing::get(aprendiendo_mcp::embedded_oauth::authorization_server_metadata).with_state(config_arc.clone()))
-        .route("/oauth/jwks", axum::routing::get(aprendiendo_mcp::embedded_oauth::jwks).with_state(state.clone()))
-        .route("/oauth/authorize", axum::routing::get(aprendiendo_mcp::embedded_oauth::authorize_get).with_state(config_arc.clone()).post(aprendiendo_mcp::embedded_oauth::authorize_post).with_state(state.clone()))
-        .route("/oauth/token", axum::routing::post(aprendiendo_mcp::embedded_oauth::token_post).with_state(state.clone()));
+        .route(
+            "/.well-known/oauth-authorization-server",
+            axum::routing::get(aprendiendo_mcp::embedded_oauth::authorization_server_metadata)
+                .with_state(config_arc.clone()),
+        )
+        .route(
+            "/oauth/jwks",
+            axum::routing::get(aprendiendo_mcp::embedded_oauth::jwks).with_state(state.clone()),
+        )
+        .route(
+            "/oauth/authorize",
+            axum::routing::get(aprendiendo_mcp::embedded_oauth::authorize_get)
+                .with_state(config_arc.clone())
+                .post(aprendiendo_mcp::embedded_oauth::authorize_post)
+                .with_state(state.clone()),
+        )
+        .route(
+            "/oauth/token",
+            axum::routing::post(aprendiendo_mcp::embedded_oauth::token_post)
+                .with_state(state.clone()),
+        );
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -142,7 +167,8 @@ async fn setup_embedded_oauth_app() -> (String, reqwest::Client, tokio::task::Jo
     let client = reqwest::Client::builder()
         .cookie_store(true)
         .redirect(reqwest::redirect::Policy::none())
-        .build().unwrap();
+        .build()
+        .unwrap();
 
     (url, client, task)
 }
@@ -152,17 +178,36 @@ async fn embedded_oauth_flow() {
     let (base_url, client, task) = setup_embedded_oauth_app().await;
 
     // 1. Metadata
-    let meta: Value = client.get(format!("{}/.well-known/oauth-authorization-server", base_url))
-        .send().await.unwrap().json().await.unwrap();
+    let meta: Value = client
+        .get(format!(
+            "{}/.well-known/oauth-authorization-server",
+            base_url
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     assert_eq!(meta["issuer"], "http://localhost");
+    assert_eq!(meta["authorization_response_iss_parameter_supported"], true);
 
     // 2. JWKS
-    let jwks: Value = client.get(format!("{}/oauth/jwks", base_url))
-        .send().await.unwrap().json().await.unwrap();
+    let jwks: Value = client
+        .get(format!("{}/oauth/jwks", base_url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     assert_eq!(jwks["keys"][0]["kid"], "1");
 
     // 3. Authorize GET (get CSRF token)
-    let authorize_url = format!("{}/oauth/authorize?client_id=test_client&redirect_uri=http://localhost/callback&response_type=code&scope=learning:access&code_challenge=challenge123&code_challenge_method=S256", base_url);
+    let authorize_url = format!(
+        "{}/oauth/authorize?client_id=test_client&redirect_uri=http://localhost/callback&response_type=code&scope=learning:access&code_challenge=challenge123&code_challenge_method=S256",
+        base_url
+    );
     let resp = client.get(&authorize_url).send().await.unwrap();
     let html = resp.text().await.unwrap();
     assert!(html.contains("csrf_token"));
@@ -175,17 +220,27 @@ async fn embedded_oauth_flow() {
     // 4. Authorize POST
     // reqwest follows redirects by default. The test redirect_uri is http://localhost/callback,
     // which fails to connect. We need to disable auto-redirects.
-    let resp = client.post(&authorize_url)
+    let resp = client
+        .post(&authorize_url)
         .form(&[
             ("username", "test_user"),
             ("password", "test_password"),
             ("csrf_token", csrf_token),
             ("action", "authorize"),
         ])
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
 
-    let final_url = resp.headers().get("location").unwrap().to_str().unwrap().to_string();
+    let final_url = resp
+        .headers()
+        .get("location")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
     assert!(final_url.starts_with("http://localhost/callback?code="));
+    assert!(final_url.contains("&iss=http://localhost"));
 
     let code_start = final_url.find("code=").unwrap() + 5;
     let _code = &final_url[code_start..];
@@ -195,32 +250,47 @@ async fn embedded_oauth_flow() {
     let mut hasher = Sha256::new();
     hasher.update(b"verifier123");
     let hash = hasher.finalize();
-    let expected_challenge = base64::Engine::encode(
-        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
-        hash,
-    );
+    let expected_challenge =
+        base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, hash);
 
     // Get new code with correct challenge
-    let authorize_url = format!("{}/oauth/authorize?client_id=test_client&redirect_uri=http://localhost/callback&response_type=code&scope=learning:access&code_challenge={}&code_challenge_method=S256", base_url, expected_challenge);
+    let authorize_url = format!(
+        "{}/oauth/authorize?client_id=test_client&redirect_uri=http://localhost/callback&response_type=code&scope=learning:access&code_challenge={}&code_challenge_method=S256",
+        base_url, expected_challenge
+    );
     let resp = client.get(&authorize_url).send().await.unwrap();
     let html = resp.text().await.unwrap();
     let csrf_start = html.find("name=\"csrf_token\" value=\"").unwrap() + 25;
     let csrf_end = html[csrf_start..].find("\"").unwrap() + csrf_start;
     let csrf_token = &html[csrf_start..csrf_end];
 
-    let resp = client.post(&authorize_url)
+    let resp = client
+        .post(&authorize_url)
         .form(&[
             ("username", "test_user"),
             ("password", "test_password"),
             ("csrf_token", csrf_token),
             ("action", "authorize"),
         ])
-        .send().await.unwrap();
-    let final_url = resp.headers().get("location").unwrap().to_str().unwrap().to_string();
+        .send()
+        .await
+        .unwrap();
+    let final_url = resp
+        .headers()
+        .get("location")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
     let code_start = final_url.find("code=").unwrap() + 5;
-    let code = &final_url[code_start..];
+    let code_end = final_url[code_start..]
+        .find('&')
+        .map(|offset| code_start + offset)
+        .unwrap_or(final_url.len());
+    let code = &final_url[code_start..code_end];
 
-    let token_resp: Value = client.post(format!("{}/oauth/token", base_url))
+    let token_resp: Value = client
+        .post(format!("{}/oauth/token", base_url))
         .form(&[
             ("grant_type", "authorization_code"),
             ("code", code),
@@ -228,7 +298,12 @@ async fn embedded_oauth_flow() {
             ("redirect_uri", "http://localhost/callback"),
             ("code_verifier", "verifier123"),
         ])
-        .send().await.unwrap().json().await.unwrap();
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
 
     assert!(token_resp.get("access_token").is_some());
     assert_eq!(token_resp["token_type"], "Bearer");

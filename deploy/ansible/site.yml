@@ -1,0 +1,238 @@
+---
+- name: Deploy Aprendiendo MCP with Docker and Caddy
+  hosts: mcp
+  become: true
+  vars_files:
+    - group_vars/mcp/secrets.yml
+  pre_tasks:
+    - name: Verify required secret variables are supplied
+      ansible.builtin.assert:
+        that:
+          - mcp_oauth_username is string
+          - mcp_oauth_username is not search('replace-me')
+          - mcp_oauth_password_hash is match('^\\$argon2id\\$')
+        fail_msg: >-
+          Supply real deployment values in group_vars/mcp/secrets.yml
+          (preferably encrypted with ansible-vault) before deployment.
+      no_log: true
+
+  tasks:
+    - name: Install Docker Engine and Compose plugin prerequisites
+      ansible.builtin.apt:
+        name:
+          - ca-certificates
+          - curl
+          - docker.io
+          - docker-compose-v2
+          - git
+          - openssl
+        state: present
+        update_cache: true
+
+    - name: Enable Docker
+      ansible.builtin.service:
+        name: docker
+        state: started
+        enabled: true
+
+    - name: Create deployment directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0750'
+      loop:
+        - "{{ mcp_deploy_dir }}"
+        - "{{ mcp_deploy_dir }}/app"
+        - "{{ mcp_deploy_dir }}/secrets"
+
+    - name: Upload application build files from this working tree
+      ansible.builtin.copy:
+        src: "../../{{ item }}"
+        dest: "{{ mcp_deploy_dir }}/app/{{ item }}"
+        owner: root
+        group: root
+        mode: preserve
+      loop:
+        - Cargo.toml
+        - Cargo.lock
+        - Dockerfile
+
+    - name: Upload application source directories from this working tree
+      ansible.builtin.copy:
+        src: "../../{{ item }}"
+        dest: "{{ mcp_deploy_dir }}/app/"
+        owner: root
+        group: root
+        directory_mode: '0755'
+      loop:
+        - src
+        - sql
+
+    - name: Check whether the production SQLite database exists
+      ansible.builtin.stat:
+        path: "{{ mcp_deploy_dir }}/app/data/aprendiendo.sqlite3"
+      register: production_database
+
+    - name: Seed the production SQLite database once
+      ansible.builtin.copy:
+        src: ../../data/aprendiendo.sqlite3
+        dest: "{{ mcp_deploy_dir }}/app/data/aprendiendo.sqlite3"
+        owner: '65532'
+        group: '65532'
+        mode: '0600'
+      when: not production_database.stat.exists
+
+    - name: Make the persistent data directory writable by the application
+      ansible.builtin.file:
+        path: "{{ mcp_deploy_dir }}/app/data"
+        state: directory
+        owner: '65532'
+        group: '65532'
+        mode: '0700'
+
+    - name: Write production environment
+      ansible.builtin.copy:
+        dest: "{{ mcp_deploy_dir }}/app/.env"
+        owner: root
+        group: root
+        mode: '0600'
+        content: |
+          DATABASE_PATH=/data/aprendiendo.sqlite3
+          DATABASE_TIMEOUT_SECONDS=10
+          BIND_ADDR=0.0.0.0:8080
+          MAX_REQUEST_BYTES=131072
+          RUST_LOG=aprendiendo_mcp=info,tower_http=info
+          AUTH_MODE=embedded_oauth
+          PUBLIC_BASE_URL={{ mcp_public_base_url }}
+          OAUTH_USERNAME={{ mcp_oauth_username }}
+          # Compose interpolates dollar-prefixed text in unquoted env-file values.
+          # Single quotes preserve the Argon2 hash literally and are stripped
+          # before the value is passed to the container.
+          OAUTH_PASSWORD_HASH='{{ mcp_oauth_password_hash }}'
+          OAUTH_RSA_KEY_PATH=/run/secrets/oauth-signing-key.pem
+          OAUTH_CLIENT_ID={{ mcp_oauth_client_id }}
+          OAUTH_REDIRECT_URI={{ mcp_oauth_redirect_uri }}
+          OIDC_REQUIRED_SCOPE=learning:access
+      no_log: true
+
+    - name: Generate the persistent OAuth signing key once
+      ansible.builtin.command:
+        argv:
+          - openssl
+          - genpkey
+          - -algorithm
+          - RSA
+          - -pkeyopt
+          - rsa_keygen_bits:3072
+          - -out
+          - "{{ mcp_deploy_dir }}/secrets/oauth-signing-key.pem"
+        creates: "{{ mcp_deploy_dir }}/secrets/oauth-signing-key.pem"
+
+    - name: Protect OAuth signing key
+      ansible.builtin.file:
+        path: "{{ mcp_deploy_dir }}/secrets/oauth-signing-key.pem"
+        # The application image runs as this fixed, non-root numeric account.
+        owner: '65532'
+        group: '65532'
+        mode: '0400'
+
+    - name: Install the Docker Compose configuration
+      ansible.builtin.copy:
+        dest: "{{ mcp_deploy_dir }}/app/compose.production.yaml"
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          services:
+            mcp:
+              build: .
+              restart: unless-stopped
+              env_file: .env
+              read_only: true
+              tmpfs:
+                - /tmp:size=8m,mode=1777
+              volumes:
+                - {{ mcp_deploy_dir }}/secrets/oauth-signing-key.pem:/run/secrets/oauth-signing-key.pem:ro
+                - {{ mcp_deploy_dir }}/app/data:/data
+              mem_limit: 96m
+              pids_limit: 256
+              cap_drop:
+                - ALL
+              security_opt:
+                - no-new-privileges:true
+            caddy:
+              image: {{ mcp_caddy_image }}
+              restart: unless-stopped
+              ports:
+                - "80:80"
+                - "443:443"
+              volumes:
+                - ./Caddyfile:/etc/caddy/Caddyfile:ro
+                - caddy_data:/data
+                - caddy_config:/config
+              cap_drop:
+                - ALL
+              cap_add:
+                - NET_BIND_SERVICE
+              security_opt:
+                - no-new-privileges:true
+              depends_on:
+                mcp:
+                  condition: service_started
+
+          volumes:
+            caddy_data:
+            caddy_config:
+
+    - name: Install Caddy configuration
+      ansible.builtin.copy:
+        dest: "{{ mcp_deploy_dir }}/app/Caddyfile"
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          {
+              admin off
+          }
+
+          {{ mcp_domain }} {
+              encode zstd gzip
+              log {
+                  output stdout
+                  format json
+              }
+              header {
+                  -Server
+                  Strict-Transport-Security "max-age=31536000; includeSubDomains"
+                  X-Content-Type-Options "nosniff"
+              }
+              reverse_proxy mcp:8080
+          }
+
+    - name: Start the application and TLS proxy
+      ansible.builtin.command:
+        argv:
+          - docker
+          - compose
+          - -f
+          - compose.production.yaml
+          - up
+          - --detach
+          - --build
+          - --force-recreate
+      args:
+        chdir: "{{ mcp_deploy_dir }}/app"
+      changed_when: true
+
+    - name: Verify service health locally through Caddy
+      ansible.builtin.uri:
+        url: "https://{{ mcp_domain }}/health"
+        return_content: true
+        status_code: 200
+        validate_certs: true
+      register: mcp_health
+      retries: 12
+      delay: 5
+      until: mcp_health.status == 200

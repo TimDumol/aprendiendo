@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use aprendiendo_mcp::{
     auth::{Authenticator, protected_resource_metadata, require_auth},
     config::Config,
-    db::{PostgresStore, SharedStore},
+    db::{SharedStore, SqliteStore},
     server::LearningServer,
 };
 use axum::{
@@ -18,7 +18,8 @@ use rmcp::transport::streamable_http_server::{
 };
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
+use tracing::{Level, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Clone)]
@@ -38,18 +39,23 @@ async fn main() -> Result<()> {
         .init();
 
     let config = Config::from_env()?;
-    let store: SharedStore = Arc::new(PostgresStore::new(
-        config.database_url.clone(),
-        config.database_pool_size,
-        config.database_timeout,
-    )?);
+    let store: SharedStore = Arc::new(SqliteStore::new(&config.database_path)?);
     store.ping().await.context("initial database ping failed")?;
     let oauth_scope = match &config.auth {
         aprendiendo_mcp::config::AuthConfig::Oidc(oidc) => Some(oidc.required_scope.clone()),
-        aprendiendo_mcp::config::AuthConfig::EmbeddedOauth(embed) => Some(embed.required_scope.clone()),
+        aprendiendo_mcp::config::AuthConfig::EmbeddedOauth(embed) => {
+            Some(embed.required_scope.clone())
+        }
         aprendiendo_mcp::config::AuthConfig::Disabled => None,
         aprendiendo_mcp::config::AuthConfig::Bearer(_) => None,
     };
+    let public_host = match &config.auth {
+        aprendiendo_mcp::config::AuthConfig::Oidc(oidc) => Some(&oidc.public_base_url),
+        aprendiendo_mcp::config::AuthConfig::EmbeddedOauth(embed) => Some(&embed.public_base_url),
+        _ => None,
+    }
+    .and_then(|base_url| url::Url::parse(base_url).ok())
+    .and_then(|url| url.host_str().map(str::to_owned));
     let auth = Authenticator::new(config.auth.clone()).await?;
     if matches!(auth, Authenticator::Disabled) {
         warn!("authentication is disabled; do not expose this listener publicly");
@@ -57,13 +63,23 @@ async fn main() -> Result<()> {
 
     let cancellation = CancellationToken::new();
     let template = LearningServer::new(store.clone(), oauth_scope);
+    let mut transport_config = StreamableHttpServerConfig::default()
+        .with_legacy_session_mode(false)
+        .with_json_response(true)
+        .with_cancellation_token(cancellation.child_token());
+    if let Some(public_host) = public_host {
+        transport_config = transport_config.with_allowed_hosts([
+            "localhost".to_owned(),
+            "127.0.0.1".to_owned(),
+            "::1".to_owned(),
+            public_host,
+        ]);
+    }
+
     let mcp_service = StreamableHttpService::new(
         move || Ok(template.clone()),
         LocalSessionManager::default().into(),
-        StreamableHttpServerConfig::default()
-            .with_legacy_session_mode(false)
-            .with_json_response(true)
-            .with_cancellation_token(cancellation.child_token()),
+        transport_config,
     );
 
     let protected = Router::new()
@@ -88,7 +104,8 @@ async fn main() -> Result<()> {
         let oauth_routes = Router::new()
             .route(
                 "/.well-known/oauth-authorization-server",
-                get(aprendiendo_mcp::embedded_oauth::authorization_server_metadata).with_state(config_arc.clone()),
+                get(aprendiendo_mcp::embedded_oauth::authorization_server_metadata)
+                    .with_state(config_arc.clone()),
             )
             .route(
                 "/oauth/jwks",
@@ -96,15 +113,31 @@ async fn main() -> Result<()> {
             )
             .route(
                 "/oauth/authorize",
-                get(aprendiendo_mcp::embedded_oauth::authorize_get).with_state(config_arc)
-                    .post(aprendiendo_mcp::embedded_oauth::authorize_post).with_state(state.clone()),
+                get(aprendiendo_mcp::embedded_oauth::authorize_get)
+                    .with_state(config_arc)
+                    .post(aprendiendo_mcp::embedded_oauth::authorize_post)
+                    .with_state(state.clone()),
             )
             .route(
                 "/oauth/token",
-                axum::routing::post(aprendiendo_mcp::embedded_oauth::token_post).with_state(state.clone()),
+                axum::routing::post(aprendiendo_mcp::embedded_oauth::token_post)
+                    .with_state(state.clone()),
             );
         app = app.merge(oauth_routes);
     }
+
+    // Log method, URI, status, and latency for every request. Headers and bodies
+    // are deliberately excluded so credentials, cookies, and OAuth codes do not
+    // end up in the application logs.
+    app = app.layer(
+        TraceLayer::new_for_http()
+            .make_span_with(
+                DefaultMakeSpan::new()
+                    .level(Level::INFO)
+                    .include_headers(false),
+            )
+            .on_response(DefaultOnResponse::new().level(Level::INFO)),
+    );
 
     let listener = tokio::net::TcpListener::bind(config.bind_addr)
         .await
