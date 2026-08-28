@@ -35,6 +35,41 @@
         state: started
         enabled: true
 
+    - name: Inspect the shared Caddy edge network
+      ansible.builtin.command:
+        argv:
+          - docker
+          - network
+          - inspect
+          - --format
+          - "{{ '{{' }}.Driver{{ '}}' }}"
+          - caddy-edge
+      check_mode: false
+      changed_when: false
+      failed_when: false
+      register: caddy_edge_inspect
+
+    - name: Reject a non-bridge shared Caddy edge network
+      ansible.builtin.assert:
+        that:
+          - caddy_edge_inspect.rc != 0 or caddy_edge_inspect.stdout | trim == 'bridge'
+        fail_msg: caddy-edge exists but is not a Docker bridge network.
+
+    - name: Create the shared Caddy edge network when absent
+      ansible.builtin.command:
+        argv:
+          - docker
+          - network
+          - create
+          - --driver
+          - bridge
+          - caddy-edge
+      when:
+        - caddy_edge_inspect.rc != 0
+        - not ansible_check_mode
+      check_mode: false
+      changed_when: true
+
     - name: Create deployment directories
       ansible.builtin.file:
         path: "{{ item }}"
@@ -46,6 +81,14 @@
         - "{{ mcp_deploy_dir }}"
         - "{{ mcp_deploy_dir }}/app"
         - "{{ mcp_deploy_dir }}/secrets"
+
+    - name: Create the root-owned shared Caddy site directory
+      ansible.builtin.file:
+        path: "{{ mcp_caddy_sites_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
 
     - name: Upload application build files from this working tree
       ansible.builtin.copy:
@@ -162,6 +205,9 @@
                 - ALL
               security_opt:
                 - no-new-privileges:true
+              networks:
+                default: {}
+                caddy-edge: {}
             caddy:
               image: {{ mcp_caddy_image }}
               restart: unless-stopped
@@ -170,6 +216,7 @@
                 - "443:443"
               volumes:
                 - ./Caddyfile:/etc/caddy/Caddyfile:ro
+                - {{ mcp_caddy_sites_dir }}:/etc/caddy/sites-enabled:ro
                 - caddy_data:/data
                 - caddy_config:/config
               cap_drop:
@@ -178,9 +225,18 @@
                 - NET_BIND_SERVICE
               security_opt:
                 - no-new-privileges:true
+              networks:
+                default: {}
+                caddy-edge: {}
               depends_on:
                 mcp:
                   condition: service_started
+
+          networks:
+              default: {}
+              caddy-edge:
+                external: true
+                name: caddy-edge
 
           volumes:
             caddy_data:
@@ -194,8 +250,10 @@
         mode: '0644'
         content: |
           {
-              admin off
+              admin 127.0.0.1:2019
           }
+
+          import sites-enabled/*
 
           {{ mcp_domain }} {
               encode zstd gzip

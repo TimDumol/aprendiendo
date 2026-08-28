@@ -5,7 +5,8 @@ mcp_public_base_url: "https://{{ mcp_domain }}"
 mcp_deploy_dir: "/opt/{{ mcp_app_name }}"
 mcp_oauth_client_id: https://chatgpt.com/oauth/client.json
 mcp_oauth_redirect_uri: https://chatgpt.com/connector_platform_oauth_redirect
+mcp_caddy_sites_dir: /opt/caddy/sites-enabled
 
 # Caddy obtains and renews the public certificate.  Cloudflare should use
 # Full (strict) mode and proxy DNS to this host; ports 80 and 443 must reach it.
-mcp_caddy_image: caddy:2-alpine
+mcp_caddy_image: caddy:2.11.4
