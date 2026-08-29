@@ -2,8 +2,6 @@
 
 A small, project-scoped Model Context Protocol server for the **Aprendiendo Español** ChatGPT project. It replaces Neon project/table/schema discovery and arbitrary SQL with six stable learning operations.
 
-For the complete implementation history, verified Neon state, deployment checklist, security notes, and remaining work, see [`HANDOVER.md`](HANDOVER.md).
-
 ## Tool surface
 
 - `get_learning_context`
@@ -13,7 +11,6 @@ For the complete implementation history, verified Neon state, deployment checkli
 - `upsert_weakness`
 - `get_data_status`
 
-The Neon connection is server configuration and is intentionally absent from every tool schema. The inspected database is a single-learner store, so no synthetic learner ID is passed through the MCP or adapter.
 
 ## Architecture
 
@@ -24,8 +21,6 @@ ChatGPT Project
     -> SQLite transactions and bounded queries
     -> sessions / attempts / observations / weaknesses in /data/aprendiendo.sqlite3
 ```
-
-The Rust `LearningStore` trait is the compatibility boundary, so the MCP tool schemas did not change during the move from Neon to SQLite.
 
 ## Database setup
 
