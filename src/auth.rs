@@ -41,7 +41,41 @@ pub struct OidcAuthenticator {
 #[derive(Debug, Deserialize)]
 struct Claims {
     sub: String,
-    scope: Option<String>,
+    scope: Option<ScopeClaim>,
+    #[serde(rename = "scp")]
+    scp: Option<ScopeClaim>,
+    #[serde(rename = "type")]
+    token_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum ScopeClaim {
+    SpaceSeparated(String),
+    List(Vec<String>),
+}
+
+impl ScopeClaim {
+    fn contains(&self, required: &str) -> bool {
+        match self {
+            Self::SpaceSeparated(value) => value
+                .split_ascii_whitespace()
+                .any(|scope| scope == required),
+            Self::List(values) => values.iter().any(|scope| scope == required),
+        }
+    }
+}
+
+impl Claims {
+    fn has_scope(&self, required: &str) -> bool {
+        self.scope
+            .as_ref()
+            .is_some_and(|scope| scope.contains(required))
+            || self
+                .scp
+                .as_ref()
+                .is_some_and(|scope| scope.contains(required))
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -156,13 +190,10 @@ impl Authenticator {
                 if claims.sub != config.username {
                     bail!("JWT subject is not authorized for this learner");
                 }
-                let has_scope = claims
-                    .scope
-                    .as_deref()
-                    .unwrap_or_default()
-                    .split_ascii_whitespace()
-                    .any(|scope| scope == config.required_scope);
-                if !has_scope {
+                if claims.token_type.as_deref() == Some("id-token") {
+                    bail!("OIDC ID tokens cannot be used as access tokens");
+                }
+                if !claims.has_scope(&config.required_scope) {
                     bail!("JWT does not contain the required scope");
                 }
                 Ok(())
@@ -190,13 +221,10 @@ impl Authenticator {
                 if claims.sub != auth.config.allowed_subject {
                     bail!("JWT subject is not authorized for this learner");
                 }
-                let has_scope = claims
-                    .scope
-                    .as_deref()
-                    .unwrap_or_default()
-                    .split_ascii_whitespace()
-                    .any(|scope| scope == auth.config.required_scope);
-                if !has_scope {
+                if claims.token_type.as_deref() == Some("id-token") {
+                    bail!("OIDC ID tokens cannot be used as access tokens");
+                }
+                if !claims.has_scope(&auth.config.required_scope) {
                     bail!("JWT does not contain the required scope");
                 }
                 Ok(())

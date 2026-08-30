@@ -2,6 +2,11 @@
 
 ## 1. Purpose
 
+The taxonomy, evidence, historical-bootstrap, and migration rules in
+`TAXONOMY_PLAN.md` extend and control this plan where they overlap. In
+particular, legacy observations remain historical evidence and must not be
+reconstructed into inferred FSRS reviews.
+
 This document specifies how to replace Aprendiendo's current home-grown spaced
 repetition scheduler with FSRS-6 and how to extend the MCP so it can support
 mixed Spanish drills without trying to generate language itself.

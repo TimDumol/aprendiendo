@@ -3,6 +3,11 @@ mcp_app_name: aprendiendo-mcp
 mcp_domain: mars.timdumol.com
 mcp_public_base_url: "https://{{ mcp_domain }}"
 mcp_deploy_dir: "/opt/{{ mcp_app_name }}"
+mcp_auth_mode: oidc
+mcp_oidc_issuer: https://auth.aries.timdumol.com
+mcp_oidc_jwks_url: https://auth.aries.timdumol.com/.well-known/jwks.json
+mcp_oidc_audience: "{{ mcp_public_base_url }}"
+mcp_oidc_required_scope: learning:access
 mcp_oauth_client_id: https://chatgpt.com/oauth/client.json
 mcp_oauth_redirect_uri: https://chatgpt.com/connector_platform_oauth_redirect
 mcp_caddy_sites_dir: /opt/caddy/sites-enabled

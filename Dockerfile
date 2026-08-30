@@ -4,6 +4,7 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY sql/sqlite_schema.sql ./sql/sqlite_schema.sql
+COPY sql/taxonomy_migration.sql ./sql/taxonomy_migration.sql
 RUN cargo build --locked --release
 
 FROM debian:bookworm-slim

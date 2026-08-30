@@ -8,13 +8,27 @@
     - name: Verify required secret variables are supplied
       ansible.builtin.assert:
         that:
+          - mcp_oidc_allowed_subject is string
+          - mcp_oidc_allowed_subject is match('^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$')
           - mcp_oauth_username is string
           - mcp_oauth_username is not search('replace-me')
           - mcp_oauth_password_hash is match('^\\$argon2id\\$')
         fail_msg: >-
-          Supply real deployment values in group_vars/mcp/secrets.yml
-          (preferably encrypted with ansible-vault) before deployment.
+          Supply the Pocket ID subject and preserved embedded OAuth rollback
+          values in group_vars/mcp/secrets.yml (preferably encrypted with
+          ansible-vault) before deployment.
       no_log: true
+      tags:
+        - always
+
+    - name: Verify a preloaded application image was supplied
+      ansible.builtin.assert:
+        that:
+          - mcp_image is string
+          - mcp_image | length > 0
+        fail_msg: >-
+          Supply mcp_image with the locally built application image tag;
+          use scripts/release.sh for the complete release flow.
 
   tasks:
     - name: Install Docker Engine and Compose plugin prerequisites
@@ -28,12 +42,25 @@
           - openssl
         state: present
         update_cache: true
+      tags:
+        - bootstrap
 
     - name: Enable Docker
       ansible.builtin.service:
         name: docker
         state: started
         enabled: true
+      tags:
+        - bootstrap
+
+    - name: Verify the application image is loaded
+      ansible.builtin.command:
+        argv:
+          - docker
+          - image
+          - inspect
+          - "{{ mcp_image }}"
+      changed_when: false
 
     - name: Inspect the shared Caddy edge network
       ansible.builtin.command:
@@ -90,29 +117,6 @@
         group: root
         mode: '0755'
 
-    - name: Upload application build files from this working tree
-      ansible.builtin.copy:
-        src: "../../{{ item }}"
-        dest: "{{ mcp_deploy_dir }}/app/{{ item }}"
-        owner: root
-        group: root
-        mode: preserve
-      loop:
-        - Cargo.toml
-        - Cargo.lock
-        - Dockerfile
-
-    - name: Upload application source directories from this working tree
-      ansible.builtin.copy:
-        src: "../../{{ item }}"
-        dest: "{{ mcp_deploy_dir }}/app/"
-        owner: root
-        group: root
-        directory_mode: '0755'
-      loop:
-        - src
-        - sql
-
     - name: Check whether the production SQLite database exists
       ansible.builtin.stat:
         path: "{{ mcp_deploy_dir }}/app/data/aprendiendo.sqlite3"
@@ -147,20 +151,16 @@
           BIND_ADDR=0.0.0.0:8080
           MAX_REQUEST_BYTES=131072
           RUST_LOG=aprendiendo_mcp=info,tower_http=info
-          AUTH_MODE=embedded_oauth
+          AUTH_MODE={{ mcp_auth_mode }}
           PUBLIC_BASE_URL={{ mcp_public_base_url }}
-          OAUTH_USERNAME={{ mcp_oauth_username }}
-          # Compose interpolates dollar-prefixed text in unquoted env-file values.
-          # Single quotes preserve the Argon2 hash literally and are stripped
-          # before the value is passed to the container.
-          OAUTH_PASSWORD_HASH='{{ mcp_oauth_password_hash }}'
-          OAUTH_RSA_KEY_PATH=/run/secrets/oauth-signing-key.pem
-          OAUTH_CLIENT_ID={{ mcp_oauth_client_id }}
-          OAUTH_REDIRECT_URI={{ mcp_oauth_redirect_uri }}
-          OIDC_REQUIRED_SCOPE=learning:access
+          OIDC_ISSUER={{ mcp_oidc_issuer }}
+          OIDC_JWKS_URL={{ mcp_oidc_jwks_url }}
+          OIDC_AUDIENCE={{ mcp_oidc_audience }}
+          OIDC_ALLOWED_SUBJECT={{ mcp_oidc_allowed_subject }}
+          OIDC_REQUIRED_SCOPE={{ mcp_oidc_required_scope }}
       no_log: true
 
-    - name: Generate the persistent OAuth signing key once
+    - name: Preserve the embedded OAuth signing key for the rollback window
       ansible.builtin.command:
         argv:
           - openssl
@@ -190,7 +190,8 @@
         content: |
           services:
             mcp:
-              build: .
+              image: "{{ mcp_image }}"
+              pull_policy: never
               restart: unless-stopped
               env_file: .env
               read_only: true
@@ -278,7 +279,6 @@
           - compose.production.yaml
           - up
           - --detach
-          - --build
           - --force-recreate
       args:
         chdir: "{{ mcp_deploy_dir }}/app"

@@ -122,6 +122,7 @@ pub struct LoginForm {
     pub action: String,
 }
 
+#[allow(clippy::result_large_err)]
 pub async fn authorize_get(
     State(config): State<Arc<EmbeddedOauthConfig>>,
     jar: CookieJar,
@@ -179,6 +180,7 @@ pub async fn authorize_get(
     Ok((jar.add(cookie), Html(html)))
 }
 
+#[allow(clippy::result_large_err)]
 pub async fn authorize_post(
     State(state): State<SharedOauthState>,
     jar: CookieJar,

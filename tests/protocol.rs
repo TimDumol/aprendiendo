@@ -24,7 +24,7 @@ async fn post_rpc(client: &reqwest::Client, url: &str, payload: Value) -> Value 
 }
 
 #[tokio::test]
-async fn streamable_http_lists_and_calls_six_domain_tools() {
+async fn streamable_http_lists_and_calls_domain_tools() {
     let cancellation = CancellationToken::new();
     let template = LearningServer::new(Arc::new(MockStore), None);
     let service: StreamableHttpService<LearningServer, LocalSessionManager> =
@@ -74,7 +74,7 @@ async fn streamable_http_lists_and_calls_six_domain_tools() {
     let tools = listed["result"]["tools"]
         .as_array()
         .expect("tools should be an array");
-    assert_eq!(tools.len(), 6);
+    assert_eq!(tools.len(), 9);
     assert_eq!(tools[0]["_meta"]["securitySchemes"][0]["type"], "noauth");
     let serialized = serde_json::to_string(tools).expect("tools should serialize");
     assert!(!serialized.contains("projectId"));
