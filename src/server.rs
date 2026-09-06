@@ -16,6 +16,53 @@ use crate::{
     },
 };
 
+fn inline_input_schema(
+    value: &serde_json::Value,
+    root: &serde_json::Value,
+    depth: usize,
+) -> serde_json::Value {
+    // None of the domain input models are recursive. Preserve a reference if a
+    // future recursive model reaches the guard instead of expanding forever.
+    if depth > 32 {
+        return value.clone();
+    }
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut out = serde_json::Map::new();
+            if let Some(reference) = map
+                .get("$ref")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.strip_prefix('#'))
+            {
+                if let Some(target) = root.pointer(reference) {
+                    if let Some(expanded) = inline_input_schema(target, root, depth + 1).as_object()
+                    {
+                        out = expanded.clone();
+                    }
+                }
+            }
+            for (key, child) in map {
+                if key == "$defs" {
+                    out.insert(key.clone(), child.clone());
+                    continue;
+                }
+                if key == "$ref" && !out.is_empty() {
+                    continue;
+                }
+                out.insert(key.clone(), inline_input_schema(child, root, depth + 1));
+            }
+            serde_json::Value::Object(out)
+        }
+        serde_json::Value::Array(values) => serde_json::Value::Array(
+            values
+                .iter()
+                .map(|v| inline_input_schema(v, root, depth + 1))
+                .collect(),
+        ),
+        _ => value.clone(),
+    }
+}
+
 #[derive(Clone)]
 pub struct LearningServer {
     store: SharedStore,
@@ -33,6 +80,11 @@ impl LearningServer {
             let mut meta = rmcp::model::MetaObject::new();
             meta.insert("securitySchemes".into(), schemes.clone());
             route.attr.meta = Some(meta);
+            // ChatGPT's connector can lose types behind nested local $refs.
+            // Publish concrete input shapes at the source, not generated client files.
+            let schema = serde_json::Value::Object((*route.attr.input_schema).clone());
+            let expanded = inline_input_schema(&schema, &schema, 0);
+            route.attr.input_schema = std::sync::Arc::new(expanded.as_object().unwrap().clone());
         }
         Self { store, tool_router }
     }
@@ -58,6 +110,13 @@ impl LearningServer {
             return Err(format!("{field} may contain at most {max} values"));
         }
         Ok(())
+    }
+    fn production_error(operation: &'static str, err: anyhow::Error) -> String {
+        if err.downcast_ref::<rusqlite::Error>().is_some() {
+            Self::operation_error(operation, err)
+        } else {
+            err.to_string()
+        }
     }
     fn operation_error(operation: &'static str, err: anyhow::Error) -> String {
         error!(operation,error=%err,"learning database operation failed");
@@ -89,6 +148,54 @@ impl LearningServer {
 
 #[tool_router]
 impl LearningServer {
+    /// Return durable learner preferences without loading historical sessions.
+    #[tool(
+        name = "get_practice_preferences",
+        annotations(read_only_hint = true, destructive_hint = false)
+    )]
+    pub async fn get_practice_preferences(&self) -> Result<Json<DomainResult>, String> {
+        self.store
+            .production_action("get", serde_json::json!({}))
+            .await
+            .map(|data| Json(DomainResult { data }))
+            .map_err(|e| Self::production_error("get_practice_preferences", e))
+    }
+    /// Partially update durable learner preferences with a version check and learner-intent provenance. Session-only requests belong in session_overrides.
+    #[tool(
+        name = "update_practice_preferences",
+        annotations(read_only_hint = false, destructive_hint = false)
+    )]
+    pub async fn update_practice_preferences(
+        &self,
+        Parameters(request): Parameters<crate::production::UpdatePreferencesRequest>,
+    ) -> Result<Json<DomainResult>, String> {
+        self.store
+            .production_action(
+                "update",
+                serde_json::to_value(request).map_err(|e| e.to_string())?,
+            )
+            .await
+            .map(|data| Json(DomainResult { data }))
+            .map_err(|e| Self::production_error("update_practice_preferences", e))
+    }
+    /// Validate one proposed initial turn or adaptive follow-up before delivery. Rule checks require additional tutor semantic review; a pass does not prove spontaneous cognition.
+    #[tool(
+        name = "validate_practice_plan",
+        annotations(read_only_hint = true, destructive_hint = false)
+    )]
+    pub async fn validate_practice_plan(
+        &self,
+        Parameters(request): Parameters<crate::production::ValidatePlanRequest>,
+    ) -> Result<Json<DomainResult>, String> {
+        self.store
+            .production_action(
+                "validate",
+                serde_json::to_value(request).map_err(|e| e.to_string())?,
+            )
+            .await
+            .map(|data| Json(DomainResult { data }))
+            .map_err(|e| Self::production_error("validate_practice_plan", e))
+    }
     #[tool(
         name = "get_learning_context",
         annotations(
@@ -103,8 +210,8 @@ impl LearningServer {
         Parameters(mut request): Parameters<LearningContextRequest>,
     ) -> Result<Json<DomainResult>, String> {
         let n = request.recent_sessions.unwrap_or(5);
-        if !(1..=20).contains(&n) {
-            return Err("recent_sessions must be between 1 and 20".into());
+        if n > 20 {
+            return Err("recent_sessions must be between 0 and 20".into());
         }
         if request
             .weakness_limit
@@ -310,7 +417,7 @@ impl LearningServer {
 
     #[tool(
         name = "record_practice_session",
-        description = "Atomically record one completed practice session. Use one exact canonical exercise_type_key and session-wide observation numbers. Retrying an identical request returns status=replayed; a changed request with the same idempotency_key conflicts.",
+        description = "Atomically record one completed practice session (contract_version=2). Supply production_evidence with actual prompts linked through items, separate attempts, observation assessments and interventions. Valid evidence is saved even when reviews are skipped; inspect review_decisions. Unknown cueing cannot support review. Two materially varied independent observations and supported rating evidence are required. Use one exact canonical exercise_type_key and session-wide observation numbers. Retrying an identical request returns status=replayed; a changed request with the same idempotency_key conflicts.",
         annotations(
             title = "Record practice session",
             read_only_hint = false,
@@ -502,7 +609,7 @@ impl LearningServer {
 #[tool_handler(router=self.tool_router)]
 impl ServerHandler for LearningServer {
     fn get_info(&self) -> ServerInfo {
-        let mut info=ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions("Use these tools only for the configured single-learner Spanish database. Start with get_learning_context or get_practice_brief for a planned activity. ChatGPT generates and presents exercise language; record each learner-facing prompt or turn separately. Spoken responses are stored as transcripts only: never infer audio properties or timing from transcript text. Timing and hesitation data must be explicitly learner-reported or externally measured. Record deliberate FSRS reviews under the existing evidence rules. Never ask for project IDs, database names, tables, schemas, or SQL.");
+        let mut info=ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions("Use these tools only for the configured single-learner Spanish database. Start with get_practice_brief and honor its effective preferences. Keep target wording private. Validate each communicative prompt with validate_practice_plan and perform the requested semantic review before delivering one turn; adapt follow-ups after the learner responds. Accept alternative wording: target not observed is not a failure. Finish the short initial written round before correction, quote the original with an indirect hint, then show original and correction after an unsuccessful retry. Record hints and retries separately; inspect review decisions. Never add drills merely to obtain a rating. ChatGPT generates and presents exercise language; record each learner-facing prompt or turn separately. Spoken responses are stored as transcripts only: never infer audio properties or timing from transcript text. Timing and hesitation data must be explicitly learner-reported or externally measured. Record deliberate FSRS reviews under the existing evidence rules. Never ask for project IDs, database names, tables, schemas, or SQL.");
         info.server_info = Implementation::new("aprendiendo-mcp", env!("CARGO_PKG_VERSION"))
             .with_title("Aprendiendo Español")
             .with_description("Project-scoped Spanish learning history and FSRS weakness tools");
@@ -540,7 +647,7 @@ mod tests {
             .into_iter()
             .map(|t| t.name.into_owned())
             .collect::<Vec<_>>();
-        assert_eq!(names.len(), 9);
+        assert_eq!(names.len(), 12);
         assert!(names.contains(&"get_practice_brief".to_owned()));
     }
 }

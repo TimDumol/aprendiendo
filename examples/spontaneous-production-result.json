@@ -1,0 +1,477 @@
+{
+  "validation": {
+    "checks": [],
+    "limits": "Rules do not prove independent cognition or verify what was delivered. Validate adaptive follow-ups individually.",
+    "policy_version": 1,
+    "semantic_review": "required",
+    "semantic_review_checklist": [
+      "disguised transformation or nearly supplied answer",
+      "valid alternative wording accepted",
+      "unnecessary invention burden",
+      "scenario repetition",
+      "single acceptable answer"
+    ],
+    "status": "structural_checks_passed",
+    "validator_version": 1
+  },
+  "recording": {
+    "activity_run_count": 0,
+    "attempt_count": 3,
+    "contract_version": 2,
+    "exercise_type_key": "production_drill",
+    "exercise_type_label": "production drill",
+    "item_count": 2,
+    "new_weaknesses_created": [],
+    "observation_count": 3,
+    "reflection_count": 0,
+    "review_decisions": [
+      {
+        "applied_rating": "again",
+        "eligible": true,
+        "excluded_observation_nos": [
+          3
+        ],
+        "policy_version": 1,
+        "reason_codes": [
+          "assisted_retry"
+        ],
+        "supporting_observation_nos": [
+          1,
+          2
+        ],
+        "weakness_key": "duration_llevar_gerund"
+      }
+    ],
+    "review_updates": [
+      {
+        "difficulty_after": 6.413300037384033,
+        "difficulty_before": null,
+        "due_learning_day": "2026-09-07",
+        "rating": "again",
+        "retrievability_before": null,
+        "scheduled_interval_days": 1,
+        "stability_after": 0.21199999749660492,
+        "stability_before": null,
+        "weakness_key": "duration_llevar_gerund"
+      }
+    ],
+    "session_id": 1,
+    "status": "created",
+    "stimulus_count": 0
+  },
+  "audit": {
+    "items": [
+      {
+        "activity_run_count": 0,
+        "activity_runs": [],
+        "activity_types": [],
+        "attempt_count": 3,
+        "attempts": [
+          {
+            "actual_duration_milliseconds": null,
+            "attempt_no": 1,
+            "created_at": "2026-09-06T17:21:50.612Z",
+            "observations": [
+              {
+                "assessment_phase": "cold_retrieval",
+                "category": "grammar",
+                "correction": null,
+                "error_span": null,
+                "evidence_source": "assistant",
+                "evidence_strength": "spontaneous_production",
+                "hint_level": "none",
+                "learner_effort": "some_effort",
+                "notes": null,
+                "observation_no": 1,
+                "outcome": "incorrect",
+                "produced": null,
+                "role": "targeted",
+                "severity": null,
+                "weakness_key": "duration_llevar_gerund"
+              }
+            ],
+            "practice_item_no": 1,
+            "reflections": [],
+            "response_latency_milliseconds": null,
+            "response_mode": "typed",
+            "target_duration_seconds": null,
+            "timing_source": null,
+            "transcript": "Llevo dos horas investigo el problema. Todavía no he encontrado la causa."
+          },
+          {
+            "actual_duration_milliseconds": null,
+            "attempt_no": 2,
+            "created_at": "2026-09-06T17:21:50.612Z",
+            "observations": [
+              {
+                "assessment_phase": "cold_retrieval",
+                "category": "grammar",
+                "correction": null,
+                "error_span": null,
+                "evidence_source": "assistant",
+                "evidence_strength": "spontaneous_production",
+                "hint_level": "none",
+                "learner_effort": "some_effort",
+                "notes": null,
+                "observation_no": 2,
+                "outcome": "correct",
+                "produced": null,
+                "role": "targeted",
+                "severity": null,
+                "weakness_key": "duration_llevar_gerund"
+              }
+            ],
+            "practice_item_no": 2,
+            "reflections": [],
+            "response_latency_milliseconds": null,
+            "response_mode": "typed",
+            "target_duration_seconds": null,
+            "timing_source": null,
+            "transcript": "Llevo un mes aprendiendo a pintar."
+          },
+          {
+            "actual_duration_milliseconds": null,
+            "attempt_no": 3,
+            "created_at": "2026-09-06T17:21:50.612Z",
+            "observations": [
+              {
+                "assessment_phase": "immediate_retry",
+                "category": "grammar",
+                "correction": null,
+                "error_span": null,
+                "evidence_source": "assistant",
+                "evidence_strength": "cued_production",
+                "hint_level": "indirect",
+                "learner_effort": "some_effort",
+                "notes": null,
+                "observation_no": 3,
+                "outcome": "correct",
+                "produced": null,
+                "role": "targeted",
+                "severity": null,
+                "weakness_key": "duration_llevar_gerund"
+              }
+            ],
+            "practice_item_no": 1,
+            "reflections": [],
+            "response_latency_milliseconds": null,
+            "response_mode": "typed",
+            "target_duration_seconds": null,
+            "timing_source": null,
+            "transcript": "Llevo dos horas investigando el problema."
+          }
+        ],
+        "exercise_type_key": "production_drill",
+        "exercise_type_label": "production drill",
+        "id": 1,
+        "item_count": 2,
+        "items": [
+          {
+            "activity_run_no": null,
+            "corrected_response": null,
+            "drill_type": "situational_response",
+            "feedback": null,
+            "item_no": 1,
+            "item_phase": "initial",
+            "observations": [],
+            "outcome": null,
+            "prompt": "Tu compañero necesita una actualización del problema. ¿Qué le dices?",
+            "prompt_fingerprint": "d03866b6d250af6c8998b816823f5a7263f9fb827a8b59e03cbb95b64cc68d27",
+            "reference_answer": null,
+            "response": null,
+            "target_weakness_keys": [
+              "duration_llevar_gerund"
+            ]
+          },
+          {
+            "activity_run_no": null,
+            "corrected_response": null,
+            "drill_type": "question_answer",
+            "feedback": null,
+            "item_no": 2,
+            "item_phase": "initial",
+            "observations": [],
+            "outcome": null,
+            "prompt": "¿Qué ha cambiado últimamente en tus aficiones?",
+            "prompt_fingerprint": "e49c2184de429ab0fa180737c2d71b97776ac730e5a0382d6ec4f7061fe11b7a",
+            "reference_answer": null,
+            "response": null,
+            "target_weakness_keys": [
+              "duration_llevar_gerund"
+            ]
+          }
+        ],
+        "notes": null,
+        "practice_policy": {
+          "conflicts": [],
+          "effective_preferences": {
+            "correction_policy": {
+              "after_round": true,
+              "allow_communication_breakdown_exception": true,
+              "quote_original_on_hint": true,
+              "self_correction_attempts_before_model": 1,
+              "show_original_with_model_correction": true
+            },
+            "default_practice_mode": "spontaneous",
+            "excluded_drill_types": [
+              "translation",
+              "sentence_transformation",
+              "sentence_completion",
+              "sentence_combining",
+              "minimal_pair_choice",
+              "error_correction",
+              "dialogue_completion"
+            ],
+            "prompt_policy": {
+              "adaptive_followups": true,
+              "allow_model_answer_before_attempt": false,
+              "allow_required_constructions": false,
+              "allow_sentence_starters": false,
+              "one_turn_at_a_time": true,
+              "prefer_actual_recent_experiences": true
+            },
+            "written_round_budget": {
+              "maximum": 5,
+              "minimum": 3
+            }
+          },
+          "preference_version": 1,
+          "session_overrides": null
+        },
+        "production_audit": {
+          "classification_limits": "Independent is operational tutor-supported evidence, not measured cognition or oral fluency. Unknowns remain in the denominator.",
+          "initial_sentence_count_reported": 3,
+          "initial_turn_counts": {
+            "assisted": 0,
+            "cued_controlled": 0,
+            "independent": 2,
+            "unknown": 0
+          },
+          "initial_turn_denominator": 2,
+          "policy_violations": [],
+          "repetition_limits": "Compare topic/scenario tags and prompt excerpts; these are approximate, not semantic duplicate detection.",
+          "review_decisions": [
+            {
+              "applied_rating": "again",
+              "eligible": true,
+              "excluded_observation_nos": [
+                3
+              ],
+              "policy_version": 1,
+              "reason_codes": [
+                "assisted_retry"
+              ],
+              "supporting_observation_nos": [
+                1,
+                2
+              ],
+              "weakness_key": "duration_llevar_gerund"
+            }
+          ],
+          "sentence_count_complete": true,
+          "target_observations": [
+            {
+              "assessment_provenance": {
+                "evidence": "Independent attempt of duration construction, but finite investigo replaces required gerund.",
+                "kind": "tutor_judgment"
+              },
+              "attempt_no": 1,
+              "observation_no": 1,
+              "target_accuracy": "incorrect",
+              "target_realization": "used"
+            },
+            {
+              "assessment_provenance": {
+                "evidence": "llevo un mes aprendiendo",
+                "kind": "tutor_judgment"
+              },
+              "attempt_no": 2,
+              "observation_no": 2,
+              "target_accuracy": "correct",
+              "target_realization": "used"
+            },
+            {
+              "assessment_provenance": {
+                "evidence": "Learner produced investigando after an indirect hint.",
+                "kind": "tutor_judgment"
+              },
+              "attempt_no": 3,
+              "observation_no": 3,
+              "target_accuracy": "correct",
+              "target_realization": "used"
+            }
+          ],
+          "target_opportunities": [
+            {
+              "communicative_function": "Explain ongoing activity",
+              "weakness_key": "duration_llevar_gerund"
+            }
+          ],
+          "turns": [
+            {
+              "attempt_kind": "initial",
+              "attempt_no": 1,
+              "communicative_outcome": "successful",
+              "observed_evidence_class": "independent",
+              "prompt_excerpt": "Tu compañero necesita una actualización del problema. ¿Qué le dices?",
+              "scenario_tag": "coworker_update",
+              "topic_tag": "recent_problem"
+            },
+            {
+              "attempt_kind": "initial",
+              "attempt_no": 2,
+              "communicative_outcome": "successful",
+              "observed_evidence_class": "independent",
+              "prompt_excerpt": "¿Qué ha cambiado últimamente en tus aficiones?",
+              "scenario_tag": "personal_hobby_change",
+              "topic_tag": "hobby"
+            },
+            {
+              "attempt_kind": "self_correction",
+              "attempt_no": 3,
+              "communicative_outcome": "successful",
+              "observed_evidence_class": "assisted",
+              "prompt_excerpt": "Tu compañero necesita una actualización del problema. ¿Qué le dices?",
+              "scenario_tag": "coworker_update",
+              "topic_tag": "recent_problem"
+            }
+          ],
+          "validator_version": 1
+        },
+        "production_evidence": {
+          "attempts": [
+            {
+              "assessment_provenance": {
+                "evidence": "Open update; no relevant wording previously supplied",
+                "kind": "tutor_judgment"
+              },
+              "attempt_kind": "initial",
+              "attempt_no": 1,
+              "communicative_outcome": "successful",
+              "exposure_source": null,
+              "initial_sentence_count": 2,
+              "original_attempt_no": null,
+              "prior_target_exposure": "none_known",
+              "prompt_cueing": "none_detected",
+              "scenario_tag": "coworker_update",
+              "topic_tag": "recent_problem"
+            },
+            {
+              "assessment_provenance": {
+                "evidence": "Open personal question; no relevant assistance",
+                "kind": "tutor_judgment"
+              },
+              "attempt_kind": "initial",
+              "attempt_no": 2,
+              "communicative_outcome": "successful",
+              "exposure_source": null,
+              "initial_sentence_count": 1,
+              "original_attempt_no": null,
+              "prior_target_exposure": "none_known",
+              "prompt_cueing": "none_detected",
+              "scenario_tag": "personal_hobby_change",
+              "topic_tag": "hobby"
+            },
+            {
+              "assessment_provenance": {
+                "evidence": "Open update; no relevant wording previously supplied",
+                "kind": "tutor_judgment"
+              },
+              "attempt_kind": "self_correction",
+              "attempt_no": 3,
+              "communicative_outcome": "successful",
+              "exposure_source": "Indirect hint quoted original after initial round",
+              "initial_sentence_count": null,
+              "original_attempt_no": 1,
+              "prior_target_exposure": "relevant_wording",
+              "prompt_cueing": "none_detected",
+              "scenario_tag": "coworker_update",
+              "topic_tag": "recent_problem"
+            }
+          ],
+          "interventions": [
+            {
+              "after_attempt_no": 2,
+              "before_attempt_no": 3,
+              "intervention_no": 1,
+              "kind": "indirect_hint",
+              "target_weakness_keys": [
+                "duration_llevar_gerund"
+              ],
+              "text": "Dijiste: Llevo dos horas investigo el problema. Todavía no he encontrado la causa. Revisa la forma del verbo después de la expresión de duración."
+            }
+          ],
+          "observations": [
+            {
+              "assessment_provenance": {
+                "evidence": "Independent attempt of duration construction, but finite investigo replaces required gerund.",
+                "kind": "tutor_judgment"
+              },
+              "attempt_no": 1,
+              "observation_no": 1,
+              "target_accuracy": "incorrect",
+              "target_realization": "used"
+            },
+            {
+              "assessment_provenance": {
+                "evidence": "llevo un mes aprendiendo",
+                "kind": "tutor_judgment"
+              },
+              "attempt_no": 2,
+              "observation_no": 2,
+              "target_accuracy": "correct",
+              "target_realization": "used"
+            },
+            {
+              "assessment_provenance": {
+                "evidence": "Learner produced investigando after an indirect hint.",
+                "kind": "tutor_judgment"
+              },
+              "attempt_no": 3,
+              "observation_no": 3,
+              "target_accuracy": "correct",
+              "target_realization": "used"
+            }
+          ],
+          "policy_version": 1,
+          "session_overrides": null,
+          "target_opportunities": [
+            {
+              "communicative_function": "Explain ongoing activity",
+              "weakness_key": "duration_llevar_gerund"
+            }
+          ],
+          "variation_assessments": [
+            {
+              "observation_nos": [
+                1,
+                2
+              ],
+              "rationale": "A time-sensitive coworker update versus a self-chosen change in a personal hobby; distinct communicative situations, not substituted nouns.",
+              "weakness_key": "duration_llevar_gerund"
+            }
+          ]
+        },
+        "session_date": "2026-09-06",
+        "session_observations": [],
+        "topic": "Recent experiences",
+        "total_measured_duration_milliseconds": null
+      }
+    ],
+    "repetition": {
+      "initial_turns_with_metadata": 2,
+      "limits": "Exact tag counts are approximate repetition indicators, not semantic similarity. Unknown historical turns are not silently counted as novel.",
+      "returned_session_count": 1,
+      "scenario_tag_counts": {
+        "coworker_update": 1,
+        "personal_hobby_change": 1
+      },
+      "scope": "returned sessions, initial turns only; retries excluded",
+      "sessions_with_unknown_initial_turns": 0,
+      "topic_tag_counts": {
+        "hobby": 1,
+        "recent_problem": 1
+      }
+    }
+  }
+}

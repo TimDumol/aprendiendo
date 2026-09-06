@@ -9,7 +9,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params, types::ValueR
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 
-const LATEST_VERSION: i64 = 9;
+const LATEST_VERSION: i64 = 10;
 const MIGRATIONS: &[(i64, &str, &str)] = &[
     (3, "003_baseline_snapshot", "aprendiendo-schema-3-snapshot"),
     (4, "004_taxonomy_graph", "aprendiendo-taxonomy-graph-v1"),
@@ -29,6 +29,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         9,
         "009_canonical_record_practice_session",
         "aprendiendo-canonical-record-practice-session-v1",
+    ),
+    (
+        10,
+        "010_spontaneous_production",
+        "aprendiendo-spontaneous-production-v1",
     ),
 ];
 
@@ -74,6 +79,7 @@ pub fn run(c: &mut Connection) -> Result<()> {
 fn initialize_latest(c: &mut Connection) -> Result<()> {
     let tx = c.transaction()?;
     tx.execute_batch(include_str!("../sql/sqlite_schema.sql"))?;
+    tx.execute_batch(crate::production::DDL)?;
     seed_activity_types(&tx)?;
     seed_taxonomy(&tx)?;
     insert_default_scheduler(&tx)?;
@@ -81,8 +87,8 @@ fn initialize_latest(c: &mut Connection) -> Result<()> {
         record_version(&tx, version)?;
     }
     tx.execute(
-        "INSERT INTO schema_meta(key,value) VALUES('schema_version','9')
-         ON CONFLICT(key) DO UPDATE SET value='9'",
+        "INSERT INTO schema_meta(key,value) VALUES('schema_version','10')
+         ON CONFLICT(key) DO UPDATE SET value='10'",
         [],
     )?;
     tx.commit()?;
@@ -93,6 +99,7 @@ fn initialize_legacy_catalog(c: &mut Connection) -> Result<()> {
     let tx = c.transaction()?;
     add_legacy_columns(&tx)?;
     tx.execute_batch(include_str!("../sql/sqlite_schema.sql"))?;
+    tx.execute_batch(crate::production::DDL)?;
     seed_activity_types(&tx)?;
     seed_taxonomy(&tx)?;
     insert_default_scheduler(&tx)?;
@@ -100,8 +107,8 @@ fn initialize_legacy_catalog(c: &mut Connection) -> Result<()> {
         record_version(&tx, version)?;
     }
     tx.execute(
-        "INSERT INTO schema_meta(key,value) VALUES('schema_version','9')
-         ON CONFLICT(key) DO UPDATE SET value='9'",
+        "INSERT INTO schema_meta(key,value) VALUES('schema_version','10')
+         ON CONFLICT(key) DO UPDATE SET value='10'",
         [],
     )?;
     tx.commit()?;
@@ -179,6 +186,7 @@ fn apply_migration(c: &mut Connection, version: i64) -> Result<()> {
         6 => migration_scheduler(&tx)?,
         7 => migration_cleanup(&tx)?,
         8 => migration_activities(&tx)?,
+        10 => tx.execute_batch(crate::production::DDL)?,
         9 => unreachable!("migration 9 uses the connection-level migration path"),
         _ => bail!("unsupported migration version {version}"),
     }
@@ -1949,7 +1957,7 @@ mod tests {
             c.query_row("SELECT count(*) FROM schema_migrations", [], |r| r
                 .get::<_, i64>(0))
                 .unwrap(),
-            7
+            8
         );
         assert!(!table_exists(&c, "exercise_types").unwrap());
         assert_eq!(
@@ -2068,7 +2076,7 @@ mod tests {
             .unwrap();
 
         apply_migration9(&mut c).unwrap();
-        postflight(&c).unwrap();
+        postflight_at(&c, 9).unwrap();
         migration9_counts_match(&c, &snapshots).unwrap();
         for (id, _, expected) in mappings {
             let actual: String = c

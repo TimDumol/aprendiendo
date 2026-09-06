@@ -78,7 +78,7 @@ async fn streamable_http_lists_and_calls_domain_tools() {
     let tools = listed["result"]["tools"]
         .as_array()
         .expect("tools should be an array");
-    assert_eq!(tools.len(), 9);
+    assert_eq!(tools.len(), 12);
     assert_eq!(tools[0]["_meta"]["securitySchemes"][0]["type"], "noauth");
     let serialized = serde_json::to_string(tools).expect("tools should serialize");
     assert!(!serialized.contains("projectId"));
@@ -89,6 +89,13 @@ async fn streamable_http_lists_and_calls_domain_tools() {
         .find(|tool| tool["name"] == "record_practice_session")
         .expect("record tool should be listed");
     let input_schema = &record_tool["inputSchema"];
+    assert_eq!(
+        input_schema["properties"]["items"]["items"]["type"],
+        "object"
+    );
+    assert!(input_schema["$defs"]["ProductionEvidence"]["properties"]["interventions"].is_object());
+    assert!(input_schema["properties"]["exercise_type_key"]["enum"].is_array());
+    assert!(input_schema["properties"]["attempts"]["items"]["properties"]["observations"]["items"]["properties"]["outcome"]["enum"].is_array());
     let required = input_schema["required"]
         .as_array()
         .expect("record input schema should have required fields");
@@ -140,6 +147,26 @@ async fn streamable_http_lists_and_calls_domain_tools() {
     )
     .await;
     assert!(called["result"]["structuredContent"]["data"]["recent_sessions"].is_array());
+
+    let update_args = json!({"patch":aprendiendo_mcp::production::approved(),"expected_version":0,"source":"Explicit protocol-test learner preferences"});
+    let updated=post_rpc(&client,&url,json!({"jsonrpc":"2.0","id":30,"method":"tools/call","params":{"name":"update_practice_preferences","arguments":update_args}})).await;
+    assert_eq!(updated["result"]["structuredContent"]["data"]["version"], 1);
+    let stale=post_rpc(&client,&url,json!({"jsonrpc":"2.0","id":31,"method":"tools/call","params":{"name":"update_practice_preferences","arguments":update_args}})).await;
+    assert!(
+        stale["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("preference_version_conflict")
+    );
+    let context=post_rpc(&client,&url,json!({"jsonrpc":"2.0","id":32,"method":"tools/call","params":{"name":"get_learning_context","arguments":{"recent_sessions":0}}})).await;
+    assert_eq!(
+        context["result"]["structuredContent"]["data"]["recent_sessions"],
+        json!([])
+    );
+    assert_eq!(
+        context["result"]["structuredContent"]["data"]["practice_policy"]["preference_version"],
+        1
+    );
 
     let record_arguments = json!({
         "idempotency_key": "protocol-record-001",

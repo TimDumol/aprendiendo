@@ -5,7 +5,7 @@ use serde_json::Value;
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct LearningContextRequest {
-    /// Number of recent sessions to include. Range: 1-20.
+    /// Number of recent sessions to include. Range: 0-20; durable policy is always included.
     pub recent_sessions: Option<u16>,
     /// Maximum number of active weaknesses to include. Range: 1-50.
     pub weakness_limit: Option<u16>,
@@ -917,6 +917,8 @@ pub enum DrillMix {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PracticeBriefRequest {
+    pub practice_mode: Option<crate::production::PracticeMode>,
+    pub session_overrides: Option<crate::production::SessionOverride>,
     pub count: Option<u16>,
     pub objective: Option<PracticeObjective>,
     pub level: Option<String>,
@@ -960,6 +962,10 @@ pub struct ReviewUpdate {
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RecordPracticeSessionResponse {
+    #[serde(default)]
+    pub review_decisions: Vec<crate::production::ReviewDecision>,
+    #[serde(default)]
+    pub contract_version: u16,
     pub session_id: i64,
     pub status: RecordStatus,
     pub exercise_type_key: ExerciseTypeKey,
@@ -977,6 +983,9 @@ pub struct RecordPracticeSessionResponse {
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RecordPracticeSessionRequest {
+    /// Actual delivered evidence, intervention links and policy snapshot version. Missing metadata is unknown and cannot schedule a review.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub production_evidence: Option<crate::production::ProductionEvidence>,
     /// Required nonblank key. Identical canonical requests replay; max 128 UTF-8 bytes.
     #[schemars(length(min = 1))]
     pub idempotency_key: String,

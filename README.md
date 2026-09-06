@@ -7,6 +7,9 @@ A small, project-scoped Model Context Protocol server for the **Aprendiendo Espa
 - `get_learning_context`
 - `get_recent_practice`
 - `get_practice_brief`
+- `get_practice_preferences`
+- `update_practice_preferences`
+- `validate_practice_plan`
 - `record_practice_session`
 - `get_review_queue`
 - `upsert_weakness`
@@ -82,6 +85,21 @@ retry metadata, while retaining sessions and all learning data. Stop the MCP
 service before applying that production migration so no request straddles the
 ledger reset. The removed legacy request/storage field is not accepted.
 
+## Spontaneous production
+
+Schema 10 adds durable, versioned preferences and explicit production evidence.
+Briefs resolve saved exclusions before ranking, keep target opportunities optional,
+and bound short initial written rounds. Validate each prompt before delivering one
+turn; follow-ups depend on the learner's response. Recording contract 2 saves valid
+practice even when an ineligible review is skipped. Review decisions distinguish
+independent evidence, supplied forms, unknown assistance and retries.
+
+See [implementation and rollout notes](SPONTANEOUS_PRODUCTION_IMPLEMENTATION.md)
+for the typed contracts, conservative rating policy, migration/rollback procedure,
+and executable request/response examples. The approved learner seed is explicit
+and idempotent; other databases retain their existing defaults. Schema 10 preserves
+all historical practice, schedules, review events and existing idempotency hashes.
+
 ## Spaced repetition
 
 Active weaknesses are the FSRS memory units. The server uses the official FSRS-6
@@ -89,8 +107,9 @@ Rust implementation with its default parameter vector and 0.90 desired retention
 `get_practice_brief` selects due/new weaknesses, recommends drill families, and
 returns exact recent prompts to avoid; ChatGPT supplies the exercise language.
 `record_practice_session` stores each item, target, attempt, and raw observation
-atomically, then applies at most one explicit rating per deliberately reviewed
-weakness. Incidental observations are retained without changing FSRS state.
+atomically, then applies at most one eligible explicit rating per deliberately reviewed
+weakness. New reviews require two independent, materially varied observations and
+supported rating/effort evidence; valid ineligible proposals are saved with skip reasons. Incidental observations are retained without changing FSRS state.
 Activity-aware briefs describe one of the ten supported activities and allocate
 compatible drill items. Record each learner-facing turn separately. Spoken
 answers are transcript-only; timing and hesitation data must be explicitly

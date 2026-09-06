@@ -12,6 +12,10 @@ fn main() -> Result<()> {
     let mut connection = Connection::open(&path)
         .with_context(|| format!("open SQLite database {}", path.display()))?;
     migrations::run(&mut connection)?;
+    if env::args().any(|a| a == "--seed-spontaneous-preferences") {
+        aprendiendo_mcp::production::seed(&connection)?;
+        println!("approved practice preferences seeded (existing edits preserved)");
+    }
     println!("migration complete: {}", path.display());
     Ok(())
 }

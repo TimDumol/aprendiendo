@@ -9,3 +9,5 @@ pub mod migrations;
 pub mod model;
 pub mod server;
 pub mod taxonomy;
+
+pub mod production;

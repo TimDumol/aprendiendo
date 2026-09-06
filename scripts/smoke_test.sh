@@ -11,7 +11,7 @@ docker run -d --name "$NAME" \
   -e AUTH_MODE=bearer \
   -e BEARER_TOKEN="smoke-test-token-0123456789abcdef0123456789" \
   -e BIND_ADDR=0.0.0.0:8080 -e RUST_LOG=aprendiendo_mcp=info \
-  -p 127.0.0.1:8080:8080 aprendiendo-mcp:linux >/dev/null
+  -p 127.0.0.1:8080:8080 "${APRENDIENDO_IMAGE:-aprendiendo-mcp:linux}" >/dev/null
 
 cleanup() { docker rm -f "$NAME" >/dev/null 2>&1 || true; }
 trap cleanup EXIT
@@ -32,7 +32,7 @@ MCP="http://127.0.0.1:8080/mcp"
 call() { curl -sf -X POST "$MCP" "${H[@]}" "${AUTH[@]}" -d "$1"; }
 call '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"smoke","version":"1.0"}}}' >/dev/null
 tools="$(call '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}')"
-python3 -c 'import json,sys; d=json.load(sys.stdin); tools=d["result"]["tools"]; names=[x["name"] for x in tools]; assert len(names)==9 and "get_taxonomy" in names and "upsert_concept" in names, names; record=next(x for x in tools if x["name"]=="record_practice_session"); schema=record["inputSchema"]; assert "exercise_type_key" in schema["required"] and "exercise_type" not in schema["properties"]; assert record["annotations"]["idempotentHint"] is True; print(names)' <<<"$tools"
+python3 -c 'import json,sys; d=json.load(sys.stdin); tools=d["result"]["tools"]; names=[x["name"] for x in tools]; assert len(names)==12 and "get_taxonomy" in names and "upsert_concept" in names, names; record=next(x for x in tools if x["name"]=="record_practice_session"); schema=record["inputSchema"]; assert "exercise_type_key" in schema["required"] and "exercise_type" not in schema["properties"]; assert record["annotations"]["idempotentHint"] is True; print(names)' <<<"$tools"
 
 call '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"get_data_status","arguments":{}}}' >/dev/null
 call '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"upsert_weakness","arguments":{"key":"ser-vs-estar","category":"grammar","description":"ser vs estar distinction","target_pattern":"ser/estar","active":true,"primary_concept_key":"form.grammar.syntax.copular","target_type":"form_meaning_contrast"}}}' >/dev/null

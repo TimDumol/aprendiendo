@@ -27,6 +27,10 @@ use std::{
 
 #[async_trait]
 pub trait LearningStore: Send + Sync {
+    async fn production_action(&self, action: &str, payload: Value) -> Result<Value> {
+        let _ = (action, payload);
+        bail!("unsupported production action")
+    }
     async fn learning_context(&self, request: LearningContextRequest) -> Result<Value>;
     async fn recent_practice(&self, request: RecentPracticeRequest) -> Result<Value>;
     async fn record_practice(
@@ -486,6 +490,17 @@ pub fn validate_record_practice_request(
                     "{path}.evidence_observation_nos[{number_index}] must be positive and unique"
                 )));
             }
+            if request
+                .observations
+                .iter()
+                .chain(request.items.iter().flat_map(|i| i.observations.iter()))
+                .chain(request.attempts.iter().flat_map(|a| a.observations.iter()))
+                .any(|o| o.observation_no == *number && o.weakness_key != review.weakness_key)
+            {
+                return Err(RecordPracticeError::invalid(
+                    "review observations must have the same weakness",
+                ));
+            }
             if !observation_numbers.contains(number) {
                 return Err(RecordPracticeError::unknown(format!(
                     "{path}.evidence_observation_nos[{number_index}] references an observation not in this request"
@@ -589,7 +604,7 @@ fn load_weaknesses(
     target_types: Option<&[TargetType]>,
     include_nonactive: bool,
 ) -> Result<Vec<WeaknessRow>> {
-    let mut sql="SELECT w.id,si.id,w.key,w.category,w.description,w.target_pattern,w.target_type,w.target_status,w.classification_pending,(SELECT c.key FROM weakness_concepts wc JOIN concepts c ON c.id=wc.concept_id WHERE wc.weakness_id=w.id AND wc.role='primary'),si.due_learning_day,si.stability,si.difficulty,si.last_review_at,(SELECT r.rating FROM weakness_reviews r WHERE r.scheduler_item_id=si.id ORDER BY r.reviewed_at DESC,r.id DESC LIMIT 1),(SELECT count(*) FROM weakness_reviews r WHERE r.scheduler_item_id=si.id),w.first_seen,w.last_seen,w.due_date,w.interval_days,w.ease_factor,w.repetitions,w.lapses,(SELECT count(*) FROM observations o WHERE o.weakness_id=w.id AND o.outcome IN ('incorrect','omitted')),(SELECT count(*) FROM observations o WHERE o.weakness_id=w.id AND o.outcome IN ('correct','prompted_correct')),(SELECT count(*) FROM observations o WHERE o.weakness_id=w.id),(SELECT count(DISTINCT s.session_date) FROM observations o JOIN sessions s ON s.id=o.session_id WHERE o.weakness_id=w.id AND o.outcome IN ('incorrect','omitted')),(SELECT max(s.session_date) FROM observations o JOIN sessions s ON s.id=o.session_id WHERE o.weakness_id=w.id AND o.outcome IN ('incorrect','omitted')),(SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM observations bad JOIN sessions sb ON sb.id=bad.session_id WHERE bad.weakness_id=w.id AND bad.outcome IN ('incorrect','omitted') AND sb.session_date > (SELECT max(sx.session_date) FROM observations bx JOIN sessions sx ON sx.id=bx.session_id WHERE bx.weakness_id=w.id AND bx.outcome IN ('incorrect','omitted'))) THEN 1 ELSE 0 END),COALESCE((SELECT c.key FROM weakness_concepts wc JOIN concepts c ON c.id=wc.concept_id WHERE wc.weakness_id=w.id AND wc.role='primary'),'') FROM weaknesses w LEFT JOIN scheduler_items si ON si.weakness_id=w.id AND si.track='general' ".to_owned();
+    let mut sql="SELECT w.id,si.id,w.key,w.category,w.description,w.target_pattern,w.target_type,w.target_status,w.classification_pending,(SELECT c.key FROM weakness_concepts wc JOIN concepts c ON c.id=wc.concept_id WHERE wc.weakness_id=w.id AND wc.role='primary'),si.due_learning_day,si.stability,si.difficulty,si.last_review_at,(SELECT r.rating FROM weakness_reviews r WHERE r.scheduler_item_id=si.id ORDER BY r.reviewed_at DESC,r.id DESC LIMIT 1),(SELECT count(*) FROM weakness_reviews r WHERE r.scheduler_item_id=si.id),w.first_seen,w.last_seen,w.due_date,w.interval_days,w.ease_factor,w.repetitions,w.lapses,(SELECT count(*) FROM observations o WHERE o.weakness_id=w.id AND o.outcome IN ('incorrect','omitted') AND NOT EXISTS(SELECT 1 FROM unobserved_targets ut WHERE ut.session_id=o.session_id AND ut.observation_no=o.observation_no)),(SELECT count(*) FROM observations o WHERE o.weakness_id=w.id AND o.outcome IN ('correct','prompted_correct')),(SELECT count(*) FROM observations o WHERE o.weakness_id=w.id),(SELECT count(DISTINCT s.session_date) FROM observations o JOIN sessions s ON s.id=o.session_id WHERE o.weakness_id=w.id AND o.outcome IN ('incorrect','omitted') AND NOT EXISTS(SELECT 1 FROM unobserved_targets ut WHERE ut.session_id=o.session_id AND ut.observation_no=o.observation_no)),(SELECT max(s.session_date) FROM observations o JOIN sessions s ON s.id=o.session_id WHERE o.weakness_id=w.id AND o.outcome IN ('incorrect','omitted') AND NOT EXISTS(SELECT 1 FROM unobserved_targets ut WHERE ut.session_id=o.session_id AND ut.observation_no=o.observation_no)),(SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM observations bad JOIN sessions sb ON sb.id=bad.session_id WHERE bad.weakness_id=w.id AND bad.outcome IN ('incorrect','omitted') AND NOT EXISTS(SELECT 1 FROM unobserved_targets ut WHERE ut.session_id=bad.session_id AND ut.observation_no=bad.observation_no) AND sb.session_date > (SELECT max(sx.session_date) FROM observations bx JOIN sessions sx ON sx.id=bx.session_id WHERE bx.weakness_id=w.id AND bx.outcome IN ('incorrect','omitted') AND NOT EXISTS(SELECT 1 FROM unobserved_targets ut WHERE ut.session_id=bx.session_id AND ut.observation_no=bx.observation_no))) THEN 1 ELSE 0 END),COALESCE((SELECT c.key FROM weakness_concepts wc JOIN concepts c ON c.id=wc.concept_id WHERE wc.weakness_id=w.id AND wc.role='primary'),'') FROM weaknesses w LEFT JOIN scheduler_items si ON si.weakness_id=w.id AND si.track='general' ".to_owned();
     let mut vals: Vec<SqlValue> = Vec::new();
     sql.push_str(if include_nonactive {
         "WHERE 1=1"
@@ -999,7 +1014,7 @@ fn fetch_recent_prompts(c: &Connection, wid: i64, limit: i32) -> Result<Vec<Stri
         .collect::<rusqlite::Result<Vec<_>>>()?)
 }
 fn recent_errors(c: &Connection, wid: i64) -> Result<Vec<Value>> {
-    let mut s=c.prepare("SELECT produced,correction FROM observations WHERE weakness_id=?1 AND outcome IN ('incorrect','partially_correct','omitted') AND (produced IS NOT NULL OR correction IS NOT NULL) ORDER BY id DESC LIMIT 3")?;
+    let mut s=c.prepare("SELECT produced,correction FROM observations o WHERE weakness_id=?1 AND outcome IN ('incorrect','partially_correct','omitted') AND NOT EXISTS(SELECT 1 FROM unobserved_targets ut WHERE ut.session_id=o.session_id AND ut.observation_no=o.observation_no) AND (produced IS NOT NULL OR correction IS NOT NULL) ORDER BY id DESC LIMIT 3")?;
     Ok(s.query_map([wid],|r|Ok(json!({"produced":r.get::<_,Option<String>>(0)?,"correction":r.get::<_,Option<String>>(1)?})))?.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
@@ -1257,6 +1272,15 @@ fn eligible_recommendations(
 
 #[async_trait]
 impl LearningStore for SqliteStore {
+    async fn production_action(&self, action: &str, payload: Value) -> Result<Value> {
+        let c = self.conn()?;
+        match action {
+            "get" => crate::production::get(&c),
+            "update" => crate::production::update(&c, serde_json::from_value(payload)?),
+            "validate" => crate::production::validate(&c, serde_json::from_value(payload)?),
+            _ => bail!("unknown production action"),
+        }
+    }
     async fn learning_context(&self, request: LearningContextRequest) -> Result<Value> {
         let c = self.conn()?;
         let cfg = scheduler_config(&c)?;
@@ -1277,7 +1301,7 @@ impl LearningStore for SqliteStore {
         ));
         let full = matches!(request.detail, Some(DetailMode::Full));
         let weaknesses=rows.into_iter().map(|r|Ok(json!({"key":r.key,"category":r.category,"description":r.description,"target_pattern":r.target_pattern,"first_seen":r.first_seen,"last_seen":r.last_seen,"classification":classification(&c,r.id,full)?,"fsrs":fsrs_json(&r,day,&cfg)?,"incorrect_count":r.incorrect_count,"correct_count":r.correct_count,"observation_count":r.observation_count,"recent_prompts":fetch_recent_prompts(&c,r.id,if full{4}else{2})?}))).collect::<Result<Vec<_>>>()?;
-        let n = i32::from(request.recent_sessions.unwrap_or(5).clamp(1, 20));
+        let n = i32::from(request.recent_sessions.unwrap_or(5).min(20));
         let mut s=c.prepare("SELECT id,session_date,exercise_type_key,topic,notes,(SELECT count(*) FROM attempts a WHERE a.session_id=s.id),(SELECT count(*) FROM observations o WHERE o.session_id=s.id),(SELECT count(*) FROM practice_items p WHERE p.session_id=s.id) FROM sessions s ORDER BY session_date DESC,id DESC LIMIT ?1")?;
         let session_rows = s
             .query_map([n], |r| {
@@ -1299,6 +1323,7 @@ impl LearningStore for SqliteStore {
                 |(id, date, key, topic, notes, attempt_count, observation_count, item_count)| {
                     let exercise_type_key = exercise_type_from_db(&key)?;
                     Ok(json!({
+                        "production_audit": crate::production::session_audit(&c,id)?["audit"],
                         "id": id,
                         "session_date": date,
                         "exercise_type_key": exercise_type_key,
@@ -1313,7 +1338,7 @@ impl LearningStore for SqliteStore {
             )
             .collect::<Result<Vec<_>>>()?;
         Ok(
-            json!({"as_of":day.to_string(),"active_weaknesses":weaknesses,"recent_sessions":sessions,"activity_coverage":activity_coverage(&c,n)?,"scheduler":{"algorithm":cfg.algorithm,"algorithm_version":cfg.algorithm_version,"desired_retention":cfg.desired_retention,"parameter_set_id":cfg.parameter_set_id,"parameters_source":cfg.source}}),
+            json!({"practice_policy":crate::production::resolve(&c,None,None)?,"as_of":day.to_string(),"active_weaknesses":weaknesses,"recent_sessions":sessions,"activity_coverage":activity_coverage(&c,n)?,"scheduler":{"algorithm":cfg.algorithm,"algorithm_version":cfg.algorithm_version,"desired_retention":cfg.desired_retention,"parameter_set_id":cfg.parameter_set_id,"parameters_source":cfg.source}}),
         )
     }
 
@@ -1621,9 +1646,15 @@ impl LearningStore for SqliteStore {
             if include_observations {
                 item["session_observations"] = json!(observation_json(&c, sid, None, None)?);
             }
+            let production = crate::production::session_audit(&c, sid)?;
+            item["production_audit"] = production["audit"].clone();
+            if include_attempts {
+                item["production_evidence"] = production["recorded_evidence"].clone();
+                item["practice_policy"] = production["policy"].clone();
+            }
             result.push(item)
         }
-        Ok(json!({"items":result}))
+        Ok(json!({"repetition":crate::production::repetition_summary(&result),"items":result}))
     }
 
     async fn record_practice(
@@ -1631,6 +1662,8 @@ impl LearningStore for SqliteStore {
         x: RecordPracticeSessionRequest,
     ) -> std::result::Result<RecordPracticeSessionResponse, RecordPracticeError> {
         validate_record_practice_request(&x)?;
+        crate::production::validate_evidence(&x)
+            .map_err(|e| RecordPracticeError::invalid(e.to_string()))?;
         let request_bytes = serde_json::to_vec(&x)?;
         if request_bytes.len() > 65_536 {
             return Err(RecordPracticeError::invalid(
@@ -1671,6 +1704,19 @@ impl LearningStore for SqliteStore {
             }
             out.status = RecordStatus::Replayed;
             return Ok(out);
+        }
+        let policy = crate::production::resolve(
+            &tx,
+            None,
+            x.production_evidence
+                .as_ref()
+                .and_then(|e| e.session_overrides.as_ref()),
+        )?;
+        if x.production_evidence
+            .as_ref()
+            .is_some_and(|e| policy["preference_version"] != e.policy_version)
+        {
+            return Err(RecordPracticeError::invalid("preference_version_conflict"));
         }
         let cfg = scheduler_config(&tx)?;
         let (reviewed_at, review_dt) = normalized_timestamp(x.reviewed_at.as_deref())
@@ -1733,6 +1779,20 @@ impl LearningStore for SqliteStore {
             params![date, type_key.as_str(), x.topic, x.notes],
         )?;
         let sid = tx.last_insert_rowid();
+        if let Some(e) = &x.production_evidence {
+            for o in &e.observations {
+                if matches!(
+                    o.target_realization,
+                    crate::production::TargetRealization::NotObserved
+                        | crate::production::TargetRealization::Ambiguous
+                ) {
+                    tx.execute(
+                        "INSERT INTO unobserved_targets(session_id,observation_no) VALUES(?1,?2)",
+                        params![sid, o.observation_no],
+                    )?;
+                }
+            }
+        }
         let mut run_ids = HashMap::new();
         for run in &x.activity_runs {
             let config_json = run
@@ -1828,6 +1888,7 @@ impl LearningStore for SqliteStore {
         }
         let mut review_keys = HashSet::new();
         let mut review_updates = Vec::new();
+        let mut review_decisions = Vec::new();
         for review in &x.reviews {
             if !review_keys.insert(review.weakness_key.clone()) {
                 return Err(RecordPracticeError::invalid(
@@ -1846,8 +1907,35 @@ impl LearningStore for SqliteStore {
                     review.weakness_key
                 )));
             };
-            let initial = validate_review_evidence(&tx, sid, &row, review, &observation_ids)
-                .map_err(|error| RecordPracticeError::invalid(error.to_string()))?;
+            let mut decision = crate::production::review_decision(
+                &x,
+                review,
+                policy["preference_version"].as_u64().unwrap_or(0),
+            );
+            if !decision.eligible {
+                review_decisions.push(decision);
+                continue;
+            }
+            let mut eligible_review: crate::model::ReviewInput =
+                serde_json::from_value(serde_json::to_value(review)?)?;
+            eligible_review.evidence_observation_nos = decision.supporting_observation_nos.clone();
+            let initial = match validate_review_evidence(
+                &tx,
+                sid,
+                &row,
+                &eligible_review,
+                &observation_ids,
+            ) {
+                Ok(n) => n,
+                Err(e) => {
+                    decision.eligible = false;
+                    decision.reason_codes.push(format!("rating_policy: {e}"));
+                    review_decisions.push(decision);
+                    continue;
+                }
+            };
+            decision.applied_rating = Some(rating_name(review.rating.number()).to_owned());
+            review_decisions.push(decision);
             let prior = match (row.stability, row.difficulty, row.last_review.as_deref()) {
                 (Some(s), Some(d), Some(_)) => Some(fsrs_adapter::memory_state(s, d)?),
                 (None, None, None) => None,
@@ -1893,7 +1981,11 @@ impl LearningStore for SqliteStore {
                 due_learning_day: due.to_string(),
             });
         }
+        let audit = crate::production::audit(&x, &policy, &review_decisions);
+        tx.execute("INSERT INTO production_sessions(session_id,policy_json,evidence_json,audit_json) VALUES(?1,?2,?3,?4)",params![sid,serde_json::to_string(&policy)?,serde_json::to_string(&x.production_evidence)?,serde_json::to_string(&audit)?])?;
         let response = RecordPracticeSessionResponse {
+            contract_version: 2,
+            review_decisions,
             session_id: sid,
             status: RecordStatus::Created,
             exercise_type_key: type_key,
@@ -1949,8 +2041,25 @@ impl LearningStore for SqliteStore {
         )
     }
 
-    async fn practice_brief(&self, request: PracticeBriefRequest) -> Result<Value> {
+    async fn practice_brief(&self, mut request: PracticeBriefRequest) -> Result<Value> {
         let c = self.conn()?;
+        let policy = crate::production::constrain(&c, &mut request)?;
+        if !policy["conflicts"].as_array().unwrap().is_empty()
+            || request
+                .allowed_drill_types
+                .as_ref()
+                .is_some_and(|v| v.is_empty())
+        {
+            let mut out = policy;
+            out["status"] = json!("no_compatible_activity");
+            if out["conflicts"].as_array().unwrap().is_empty() {
+                out["conflicts"] = json!([
+                    "No permitted initial format remains; choose an open format or supply a sourced session override."
+                ]);
+            }
+            return Ok(out);
+        }
+        let spontaneous = policy["effective_preferences"]["default_practice_mode"] == "spontaneous";
         let cfg = scheduler_config(&c)?;
         let mix = request.drill_mix.unwrap_or(DrillMix::Auto);
         let activity = request.activity_type;
@@ -2111,13 +2220,22 @@ impl LearningStore for SqliteStore {
         ordered.truncate(target_count);
         let allocations = allocate(count, target_count);
         let allowed = request.allowed_drill_types.as_deref();
-        let eligible = ordered
+        let eligible_result = ordered
             .iter()
             .map(|row| {
                 eligible_recommendations(activity, mix, allowed, recommendations(&c, row.id)?)
                     .map_err(|error| anyhow!("weakness {}: {error}", row.key))
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<Result<Vec<_>>>();
+        let eligible = match eligible_result {
+            Ok(v) => v,
+            Err(e) => {
+                let mut out = policy;
+                out["status"] = json!("no_compatible_activity");
+                out["conflicts"] = json!([e.to_string()]);
+                return Ok(out);
+            }
+        };
         let prompt_limit = i32::from(request.recent_prompts_per_weakness.unwrap_or(4).min(10));
         let mut targets = Vec::new();
         for ((row, allocation), recs) in ordered.iter().zip(&allocations).zip(&eligible) {
@@ -2142,6 +2260,7 @@ impl LearningStore for SqliteStore {
                 "weakness_key": row.key,
                 "category": row.category,
                 "description": row.description,
+                "communicative_function": crate::production::communicative_function(&c,row.id)?,
                 "target_pattern": row.target_pattern,
                 "classification": classification(&c, row.id, matches!(request.drill_mix, Some(DrillMix::Custom)))?,
                 "allocation": allocation,
@@ -2253,6 +2372,39 @@ impl LearningStore for SqliteStore {
                     "Generate exactly {total} learner-facing turns according to the activity plan"
                 ),
             ]);
+        }
+        for (key, value) in policy.as_object().unwrap() {
+            response[key] = value.clone();
+        }
+        if spontaneous {
+            let opportunities=targets.iter().map(|t|json!({"weakness_key":t["weakness_key"],"communicative_function":t["communicative_function"],"elicitation_requirement":"optional","selection_reason":t["selection_reason"]})).collect::<Vec<_>>();
+            response["target_opportunities"] = json!(opportunities);
+            let mut private_targets = response["targets"].take();
+            if let Some(targets) = private_targets.as_array_mut() {
+                for target in targets {
+                    target.as_object_mut().unwrap().remove("allocation");
+                }
+            }
+            response["tutor_context"] = json!({"targets":private_targets});
+            response.as_object_mut().unwrap().remove("targets");
+            response["learner_task_constraints"] = json!({"initial_output_budget":response["effective_preferences"]["written_round_budget"],"unit":"sentences","scope":"initial_responses","one_turn_at_a_time":true,"followup_strategy":"Adapt to the actual response and remaining budget; accept valid alternative wording."});
+            response["generation_rules"] = json!([
+                format!(
+                    "Count is an upper turn bound, never an observation quota. Aim for {}–{} total initial written sentences; retries are separate.",
+                    response["effective_preferences"]["written_round_budget"]["minimum"],
+                    response["effective_preferences"]["written_round_budget"]["maximum"]
+                ),
+                "Use private targets only as optional communicative opportunities. Target not observed is not an error.",
+                "Validate the initial prompt, deliver one turn, then adapt and validate each follow-up.",
+                "After the round quote the wrong sentence and give an indirect hint. After an unsuccessful retry show original and correction together.",
+                "Do not add drills to obtain a rating. Rules cannot prove spontaneity or oral fluency."
+            ]);
+            if let Some(plan) = response.get_mut("activity_plan") {
+                plan.as_object_mut().unwrap().remove("item_allocations");
+                plan["followup_strategy"] = json!(
+                    "Respond to the learner's actual message with a relevant question or plausible complication; stop within the initial output budget."
+                );
+            }
         }
         Ok(response)
     }
@@ -2392,6 +2544,18 @@ fn all_weakness_keys(x: &RecordPracticeSessionRequest) -> Vec<String> {
     );
     v.extend(x.observations.iter().map(|o| o.weakness_key.clone()));
     v.extend(x.reviews.iter().map(|review| review.weakness_key.clone()));
+    if let Some(e) = &x.production_evidence {
+        v.extend(
+            e.target_opportunities
+                .iter()
+                .map(|o| o.weakness_key.clone()),
+        );
+        v.extend(
+            e.interventions
+                .iter()
+                .flat_map(|i| i.target_weakness_keys.iter().cloned()),
+        );
+    }
     v
 }
 
@@ -2977,6 +3141,8 @@ impl LearningStore for MockStore {
         request: RecordPracticeSessionRequest,
     ) -> std::result::Result<RecordPracticeSessionResponse, RecordPracticeError> {
         Ok(RecordPracticeSessionResponse {
+            contract_version: 2,
+            review_decisions: vec![],
             session_id: 0,
             status: RecordStatus::Created,
             exercise_type_key: request.exercise_type_key,
@@ -3102,7 +3268,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deliberate_record_creates_one_audited_review_and_replays() {
+    async fn legacy_unknown_evidence_is_saved_without_review_and_replays() {
         let store = test_store();
         let payload = json!({
             "idempotency_key": "test-deliberate-1",
@@ -3150,7 +3316,11 @@ mod tests {
             serde_json::from_value(payload.clone()).unwrap();
         let first = store.record_practice(parsed_for_record).await.unwrap();
         assert_eq!(first.status, RecordStatus::Created);
-        assert_eq!(first.review_updates.len(), 1);
+        assert_eq!(first.review_updates.len(), 0);
+        assert_eq!(
+            first.review_decisions[0].reason_codes,
+            vec!["unknown_assistance"]
+        );
         let scheduler_id: i64 = {
             let c = store.conn().unwrap();
             c.query_row(
@@ -3206,14 +3376,14 @@ mod tests {
                 r.get::<_, i64>(0)
             })
             .unwrap(),
-            1
+            0
         );
         assert_eq!(
             c.query_row("SELECT count(*) FROM review_observations", [], |r| {
                 r.get::<_, i64>(0)
             })
             .unwrap(),
-            1
+            0
         );
         assert_eq!(
             c.query_row(
@@ -3332,6 +3502,8 @@ mod tests {
         for spec in crate::activities::activity_catalog() {
             let brief = store
                 .practice_brief(PracticeBriefRequest {
+                    practice_mode: None,
+                    session_overrides: None,
                     count: None,
                     objective: None,
                     level: None,

@@ -15,6 +15,8 @@ RUN apt-get update \
 
 COPY --from=builder /build/target/release/aprendiendo-mcp /usr/local/bin/aprendiendo-mcp
 
+COPY --from=builder /build/target/release/migrate /usr/local/bin/migrate
+
 RUN mkdir /data && chown 65532:65532 /data
 USER 65532:65532
 VOLUME ["/data"]
