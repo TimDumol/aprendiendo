@@ -85,7 +85,10 @@ async fn main() -> Result<()> {
     let protected = Router::new()
         .nest_service("/mcp", mcp_service)
         .layer(DefaultBodyLimit::max(config.max_request_bytes))
-        .layer(middleware::from_fn_with_state(auth.clone(), require_auth));
+        // Keep authentication scoped to registered MCP routes. A regular
+        // `layer` also wraps the router fallback, turning unknown OIDC-only
+        // paths into 401s instead of the expected 404.
+        .route_layer(middleware::from_fn_with_state(auth.clone(), require_auth));
 
     let auth_routes = Router::new()
         .route("/health", get(health))

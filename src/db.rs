@@ -1,11 +1,12 @@
 use crate::{
-    evidence, fsrs_adapter, migrations,
+    activities, evidence, fsrs_adapter, migrations,
     model::{
-        DetailMode, DrillMix, EvidenceSource, EvidenceStrength, FsrsRating, HintLevel,
-        LearningContextRequest, NewWeaknessInput, ObservationInput, PracticeBriefRequest,
-        PracticeObjective, RatingSource, RecentPracticeRequest, RecordPracticeSessionRequest,
-        RetrievalMode, ReviewQueueRequest, TargetRelationInput, TargetType, TaxonomyRequest,
-        UpsertConceptRequest, UpsertWeaknessRequest,
+        ActivityType, DetailMode, DrillMix, DrillType, EvidenceSource, EvidenceStrength,
+        ExerciseTypeKey, FsrsRating, HintLevel, LearningContextRequest, NewWeaknessInput,
+        ObservationInput, PracticeBriefRequest, PracticeObjective, RatingSource,
+        RecentPracticeRequest, RecordPracticeSessionRequest, RecordPracticeSessionResponse,
+        RecordStatus, RetrievalMode, ReviewQueueRequest, ReviewUpdate, TargetRelationInput,
+        TargetType, TaxonomyRequest, UpsertConceptRequest, UpsertWeaknessRequest,
     },
     taxonomy,
 };
@@ -15,7 +16,7 @@ use chrono::{DateTime, Duration, NaiveDate, SecondsFormat, Timelike, Utc};
 use chrono_tz::Tz;
 use rusqlite::{Connection, OptionalExtension, params, types::Value as SqlValue};
 use serde::Serialize;
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
@@ -28,7 +29,10 @@ use std::{
 pub trait LearningStore: Send + Sync {
     async fn learning_context(&self, request: LearningContextRequest) -> Result<Value>;
     async fn recent_practice(&self, request: RecentPracticeRequest) -> Result<Value>;
-    async fn record_practice_json(&self, payload: Value) -> Result<Value>;
+    async fn record_practice(
+        &self,
+        request: RecordPracticeSessionRequest,
+    ) -> Result<RecordPracticeSessionResponse, RecordPracticeError>;
     async fn review_queue(&self, request: ReviewQueueRequest) -> Result<Value>;
     async fn practice_brief(&self, request: PracticeBriefRequest) -> Result<Value>;
     async fn upsert_weakness_json(&self, payload: Value) -> Result<Value>;
@@ -36,6 +40,62 @@ pub trait LearningStore: Send + Sync {
     async fn upsert_concept_json(&self, payload: Value) -> Result<Value>;
     async fn data_status(&self) -> Result<Value>;
     async fn ping(&self) -> Result<()>;
+}
+
+#[derive(Debug)]
+pub enum RecordPracticeError {
+    InvalidArgument(String),
+    UnknownReference(String),
+    IdempotencyConflict,
+    Internal(anyhow::Error),
+}
+
+impl std::fmt::Display for RecordPracticeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidArgument(message) => write!(f, "invalid_argument: {message}"),
+            Self::UnknownReference(message) => write!(f, "unknown_reference: {message}"),
+            Self::IdempotencyConflict => write!(
+                f,
+                "idempotency_conflict: idempotency_key was already used with a different payload"
+            ),
+            Self::Internal(_) => write!(f, "internal database operation failure"),
+        }
+    }
+}
+
+impl std::error::Error for RecordPracticeError {}
+
+impl From<anyhow::Error> for RecordPracticeError {
+    fn from(error: anyhow::Error) -> Self {
+        Self::internal(error)
+    }
+}
+
+impl From<rusqlite::Error> for RecordPracticeError {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::internal(anyhow!(error))
+    }
+}
+
+impl From<serde_json::Error> for RecordPracticeError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::internal(anyhow!(error))
+    }
+}
+
+impl RecordPracticeError {
+    fn invalid(message: impl Into<String>) -> Self {
+        Self::InvalidArgument(message.into())
+    }
+
+    fn unknown(message: impl Into<String>) -> Self {
+        Self::UnknownReference(message.into())
+    }
+
+    fn internal(error: impl Into<anyhow::Error>) -> Self {
+        Self::Internal(error.into())
+    }
 }
 
 pub struct SqliteStore {
@@ -116,8 +176,12 @@ fn learning_day_delta(previous: &str, current: &str, timezone: &str, cutoff: u32
     Ok(delta)
 }
 fn valid_date(value: &str, field: &str) -> Result<NaiveDate> {
-    NaiveDate::parse_from_str(value, "%Y-%m-%d")
-        .map_err(|_| anyhow!("{field} must be a valid YYYY-MM-DD date"))
+    let date = NaiveDate::parse_from_str(value, "%Y-%m-%d")
+        .map_err(|_| anyhow!("{field} must be a valid YYYY-MM-DD date"))?;
+    if date.format("%Y-%m-%d").to_string() != value {
+        bail!("{field} must use the exact YYYY-MM-DD format");
+    }
+    Ok(date)
 }
 fn serialize_enum<T: Serialize>(value: &T) -> Result<String> {
     serde_json::to_value(value)?
@@ -125,27 +189,323 @@ fn serialize_enum<T: Serialize>(value: &T) -> Result<String> {
         .map(str::to_owned)
         .ok_or_else(|| anyhow!("enum serialization failed"))
 }
-fn hash_payload(payload: &Value) -> Result<String> {
-    fn canonical(v: &Value) -> Value {
-        match v {
-            Value::Object(o) => {
-                let mut out = Map::new();
-                let mut keys = o.keys().collect::<Vec<_>>();
-                keys.sort();
-                for k in keys {
-                    out.insert(k.clone(), canonical(&o[k]));
-                }
-                Value::Object(out)
-            }
-            Value::Array(a) => Value::Array(a.iter().map(canonical).collect()),
-            x => x.clone(),
-        }
-    }
-    let bytes = serde_json::to_vec(&canonical(payload))?;
-    Ok(Sha256::digest(bytes)
+fn hash_bytes(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
         .iter()
         .map(|b| format!("{b:02x}"))
-        .collect())
+        .collect()
+}
+
+/// Validate the record operation without opening the database or consulting scheduler state.
+/// Database-backed references and learning-day rules are checked immediately before writes.
+pub fn validate_record_practice_request(
+    request: &RecordPracticeSessionRequest,
+) -> std::result::Result<(), RecordPracticeError> {
+    let text =
+        |value: &str, field: &str, max: usize| -> std::result::Result<(), RecordPracticeError> {
+            if value.trim().is_empty() {
+                return Err(RecordPracticeError::invalid(format!(
+                    "{field} must not be blank"
+                )));
+            }
+            if value.len() > max {
+                return Err(RecordPracticeError::invalid(format!(
+                    "{field} must be at most {max} UTF-8 bytes"
+                )));
+            }
+            Ok(())
+        };
+    let optional_text = |value: Option<&str>,
+                         field: &str,
+                         max: usize|
+     -> std::result::Result<(), RecordPracticeError> {
+        if let Some(value) = value {
+            text(value, field, max)?;
+        }
+        Ok(())
+    };
+    let list =
+        |length: usize, field: &str, max: usize| -> std::result::Result<(), RecordPracticeError> {
+            if length > max {
+                return Err(RecordPracticeError::invalid(format!(
+                    "{field} may contain at most {max} values"
+                )));
+            }
+            Ok(())
+        };
+
+    text(&request.idempotency_key, "idempotency_key", 128)?;
+    optional_text(request.session_date.as_deref(), "session_date", 10)?;
+    optional_text(request.reviewed_at.as_deref(), "reviewed_at", 128)?;
+    optional_text(request.topic.as_deref(), "topic", 500)?;
+    optional_text(request.notes.as_deref(), "notes", 4_000)?;
+    list(request.new_weaknesses.len(), "new_weaknesses", 100)?;
+    list(request.items.len(), "items", 100)?;
+    list(request.attempts.len(), "attempts", 100)?;
+    list(request.reviews.len(), "reviews", 100)?;
+    list(request.activity_runs.len(), "activity_runs", 10)?;
+
+    let mut new_keys = HashSet::new();
+    for (index, weakness) in request.new_weaknesses.iter().enumerate() {
+        let path = format!("new_weaknesses[{index}]");
+        if !new_keys.insert(&weakness.key) {
+            return Err(RecordPracticeError::invalid(format!(
+                "{path}.key is duplicated"
+            )));
+        }
+        text(&weakness.key, &format!("{path}.key"), 160)?;
+        text(&weakness.category, &format!("{path}.category"), 80)?;
+        text(&weakness.description, &format!("{path}.description"), 1_000)?;
+        optional_text(
+            weakness.target_pattern.as_deref(),
+            &format!("{path}.target_pattern"),
+            1_000,
+        )?;
+        list(
+            weakness
+                .recommended_drill_types
+                .as_ref()
+                .map_or(0, Vec::len),
+            &format!("{path}.recommended_drill_types"),
+            12,
+        )?;
+        list(
+            weakness.concept_links.len(),
+            &format!("{path}.concept_links"),
+            20,
+        )?;
+        list(
+            weakness.target_relations.len(),
+            &format!("{path}.target_relations"),
+            20,
+        )?;
+        for (link_index, link) in weakness.concept_links.iter().enumerate() {
+            text(
+                &link.concept_key,
+                &format!("{path}.concept_links[{link_index}].concept_key"),
+                160,
+            )?;
+        }
+        for (relation_index, relation) in weakness.target_relations.iter().enumerate() {
+            text(
+                &relation.other_weakness_key,
+                &format!("{path}.target_relations[{relation_index}].other_weakness_key"),
+                160,
+            )?;
+            text(
+                &relation.predicate,
+                &format!("{path}.target_relations[{relation_index}].predicate"),
+                40,
+            )?;
+            optional_text(
+                relation.notes.as_deref(),
+                &format!("{path}.target_relations[{relation_index}].notes"),
+                2_000,
+            )?;
+        }
+    }
+
+    let mut item_numbers = HashSet::new();
+    let mut observation_count = request.observations.len();
+    let mut observation_numbers = HashSet::new();
+    let mut validate_observation = |observation: &ObservationInput,
+                                    path: &str|
+     -> std::result::Result<(), RecordPracticeError> {
+        if observation.observation_no == 0
+            || !observation_numbers.insert(observation.observation_no)
+        {
+            return Err(RecordPracticeError::invalid(format!(
+                "{path}.observation_no must be positive and unique across the session"
+            )));
+        }
+        text(
+            &observation.weakness_key,
+            &format!("{path}.weakness_key"),
+            160,
+        )?;
+        optional_text(
+            observation.produced.as_deref(),
+            &format!("{path}.produced"),
+            2_000,
+        )?;
+        optional_text(
+            observation.correction.as_deref(),
+            &format!("{path}.correction"),
+            2_000,
+        )?;
+        optional_text(
+            observation.error_span.as_deref(),
+            &format!("{path}.error_span"),
+            1_000,
+        )?;
+        optional_text(
+            observation.notes.as_deref(),
+            &format!("{path}.notes"),
+            2_000,
+        )?;
+        Ok(())
+    };
+
+    for (index, item) in request.items.iter().enumerate() {
+        let path = format!("items[{index}]");
+        if item.item_no == 0 || !item_numbers.insert(item.item_no) {
+            return Err(RecordPracticeError::invalid(format!(
+                "{path}.item_no must be positive and unique"
+            )));
+        }
+        text(&item.prompt, &format!("{path}.prompt"), 4_000)?;
+        optional_text(item.response.as_deref(), &format!("{path}.response"), 8_000)?;
+        optional_text(
+            item.corrected_response.as_deref(),
+            &format!("{path}.corrected_response"),
+            8_000,
+        )?;
+        optional_text(
+            item.reference_answer.as_deref(),
+            &format!("{path}.reference_answer"),
+            8_000,
+        )?;
+        optional_text(item.feedback.as_deref(), &format!("{path}.feedback"), 4_000)?;
+        list(
+            item.target_weakness_keys.len(),
+            &format!("{path}.target_weakness_keys"),
+            20,
+        )?;
+        for (key_index, key) in item.target_weakness_keys.iter().enumerate() {
+            text(
+                key,
+                &format!("{path}.target_weakness_keys[{key_index}]"),
+                160,
+            )?;
+        }
+        list(
+            item.observations.len(),
+            &format!("{path}.observations"),
+            300,
+        )?;
+        observation_count += item.observations.len();
+        for (observation_index, observation) in item.observations.iter().enumerate() {
+            validate_observation(
+                observation,
+                &format!("{path}.observations[{observation_index}]"),
+            )?;
+        }
+    }
+
+    let mut attempt_numbers = HashSet::new();
+    for (index, attempt) in request.attempts.iter().enumerate() {
+        let path = format!("attempts[{index}]");
+        if attempt.attempt_no == 0 || !attempt_numbers.insert(attempt.attempt_no) {
+            return Err(RecordPracticeError::invalid(format!(
+                "{path}.attempt_no must be positive and unique"
+            )));
+        }
+        if attempt
+            .practice_item_no
+            .is_some_and(|number| !item_numbers.contains(&number))
+        {
+            return Err(RecordPracticeError::unknown(format!(
+                "{path}.practice_item_no references an item not in this request"
+            )));
+        }
+        text(&attempt.transcript, &format!("{path}.transcript"), 8_000)?;
+        if attempt.actual_duration_milliseconds.is_some() && attempt.timing_source.is_none() {
+            return Err(RecordPracticeError::invalid(format!(
+                "{path}.timing_source is required with actual_duration_milliseconds"
+            )));
+        }
+        if attempt.actual_duration_milliseconds.is_none() && attempt.timing_source.is_some() {
+            return Err(RecordPracticeError::invalid(format!(
+                "{path}.actual_duration_milliseconds is required with timing_source"
+            )));
+        }
+        if attempt.response_latency_milliseconds.is_some() && attempt.timing_source.is_none() {
+            return Err(RecordPracticeError::invalid(format!(
+                "{path}.timing_source is required with response_latency_milliseconds"
+            )));
+        }
+        list(
+            attempt.observations.len(),
+            &format!("{path}.observations"),
+            300,
+        )?;
+        observation_count += attempt.observations.len();
+        for (observation_index, observation) in attempt.observations.iter().enumerate() {
+            validate_observation(
+                observation,
+                &format!("{path}.observations[{observation_index}]"),
+            )?;
+        }
+        list(
+            attempt.reflections.len(),
+            &format!("{path}.reflections"),
+            20,
+        )?;
+        let mut reflection_numbers = HashSet::new();
+        for (reflection_index, reflection) in attempt.reflections.iter().enumerate() {
+            if reflection.reflection_no == 0 || !reflection_numbers.insert(reflection.reflection_no)
+            {
+                return Err(RecordPracticeError::invalid(format!(
+                    "{path}.reflections[{reflection_index}].reflection_no must be positive and unique"
+                )));
+            }
+            text(
+                &reflection.note,
+                &format!("{path}.reflections[{reflection_index}].note"),
+                4_000,
+            )?;
+        }
+    }
+    list(request.observations.len(), "observations", 300)?;
+    for (index, observation) in request.observations.iter().enumerate() {
+        validate_observation(observation, &format!("observations[{index}]"))?;
+    }
+    if observation_count > 300 {
+        return Err(RecordPracticeError::invalid(
+            "a session may contain at most 300 observations",
+        ));
+    }
+    evidence::validate_session_observation_numbers(request)
+        .map_err(|error| RecordPracticeError::invalid(error.to_string()))?;
+
+    activities::validate_activity_recording(request)
+        .map_err(|error| RecordPracticeError::invalid(error.to_string()))?;
+
+    for (index, review) in request.reviews.iter().enumerate() {
+        let path = format!("reviews[{index}]");
+        text(&review.weakness_key, &format!("{path}.weakness_key"), 160)?;
+        if review.evidence_observation_nos.is_empty() {
+            return Err(RecordPracticeError::invalid(format!(
+                "{path}.evidence_observation_nos must not be empty"
+            )));
+        }
+        let mut evidence_numbers = HashSet::new();
+        for (number_index, number) in review.evidence_observation_nos.iter().enumerate() {
+            if *number == 0 || !evidence_numbers.insert(*number) {
+                return Err(RecordPracticeError::invalid(format!(
+                    "{path}.evidence_observation_nos[{number_index}] must be positive and unique"
+                )));
+            }
+            if !observation_numbers.contains(number) {
+                return Err(RecordPracticeError::unknown(format!(
+                    "{path}.evidence_observation_nos[{number_index}] references an observation not in this request"
+                )));
+            }
+        }
+        optional_text(
+            review.rating_rationale.as_deref(),
+            &format!("{path}.rating_rationale"),
+            1_000,
+        )?;
+        let evidence_bytes = serde_json::to_vec(&review.evidence)
+            .map_err(|error| RecordPracticeError::internal(anyhow!(error)))?;
+        if evidence_bytes.len() > 4_096 {
+            return Err(RecordPracticeError::invalid(format!(
+                "{path}.evidence must be at most 4096 serialized bytes"
+            )));
+        }
+    }
+    Ok(())
 }
 fn prompt_fingerprint(prompt: &str) -> String {
     let normalized = prompt
@@ -157,6 +517,23 @@ fn prompt_fingerprint(prompt: &str) -> String {
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect()
+}
+
+fn stimulus_fingerprint(content_text: Option<&str>, source_uri: Option<&str>) -> Option<String> {
+    let value = content_text
+        .map(|text| {
+            text.to_lowercase()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .or_else(|| source_uri.map(str::trim).map(str::to_owned))?;
+    Some(
+        Sha256::digest(value.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -483,6 +860,139 @@ fn observation_json(
     }
     Ok(out)
 }
+
+fn activity_types_for_session(c: &Connection, sid: i64) -> Result<Vec<String>> {
+    Ok(c
+        .prepare(
+            "SELECT DISTINCT activity_type_key FROM activity_runs WHERE session_id=?1 ORDER BY activity_type_key",
+        )?
+        .query_map([sid], |row| row.get(0))?
+        .collect::<rusqlite::Result<Vec<String>>>()?)
+}
+
+fn activity_runs_json(c: &Connection, sid: i64) -> Result<Vec<Value>> {
+    let mut stmt = c.prepare(
+        "SELECT id,run_no,activity_type_key,planned_duration_seconds,actual_duration_milliseconds,timing_source,config_json,notes
+         FROM activity_runs WHERE session_id=?1 ORDER BY run_no",
+    )?;
+    let mut runs = Vec::new();
+    for row in stmt.query_map([sid], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, Option<i64>>(3)?,
+            r.get::<_, Option<i64>>(4)?,
+            r.get::<_, Option<String>>(5)?,
+            r.get::<_, String>(6)?,
+            r.get::<_, Option<String>>(7)?,
+        ))
+    })? {
+        let (id, run_no, activity_type, planned, actual, timing_source, config, notes) = row?;
+        let config: Value = serde_json::from_str(&config)?;
+        let mut stimuli_stmt = c.prepare(
+            "SELECT stimulus_no,kind,delivery_mode,content_text,source_uri,content_fingerprint
+             FROM activity_stimuli WHERE activity_run_id=?1 ORDER BY stimulus_no",
+        )?;
+        let stimuli = stimuli_stmt
+            .query_map([id], |r| {
+                Ok(json!({
+                    "stimulus_no": r.get::<_, i64>(0)?,
+                    "kind": r.get::<_, String>(1)?,
+                    "delivery_mode": r.get::<_, String>(2)?,
+                    "content_text": r.get::<_, Option<String>>(3)?,
+                    "source_uri": r.get::<_, Option<String>>(4)?,
+                    "content_fingerprint": r.get::<_, Option<String>>(5)?,
+                }))
+            })?
+            .collect::<rusqlite::Result<Vec<Value>>>()?;
+        runs.push(json!({
+            "run_no": run_no,
+            "activity_type": activity_type,
+            "planned_duration_seconds": planned,
+            "actual_duration_milliseconds": actual,
+            "timing_source": timing_source,
+            "config": config,
+            "notes": notes,
+            "stimuli": stimuli,
+        }));
+    }
+    Ok(runs)
+}
+
+fn session_measured_duration(c: &Connection, sid: i64) -> Result<Option<i64>> {
+    let mut stmt = c.prepare(
+        "SELECT id,actual_duration_milliseconds,timing_source FROM activity_runs WHERE session_id=?1 ORDER BY run_no",
+    )?;
+    let runs = stmt
+        .query_map([sid], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, Option<i64>>(1)?,
+                r.get::<_, Option<String>>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if runs.is_empty() {
+        return Ok(None);
+    }
+    let mut total = 0i64;
+    for (run_id, actual, timing_source) in runs {
+        if let (Some(actual), Some(_)) = (actual, timing_source.as_ref()) {
+            total = total
+                .checked_add(actual)
+                .ok_or_else(|| anyhow!("measured duration overflow"))?;
+            continue;
+        }
+        let mut attempts = c.prepare(
+            "SELECT a.actual_duration_milliseconds,a.timing_source
+             FROM attempts a JOIN practice_items p ON p.id=a.practice_item_id
+             WHERE p.activity_run_id=?1",
+        )?;
+        let values = attempts
+            .query_map([run_id], |r| {
+                Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, Option<String>>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if values.is_empty()
+            || values
+                .iter()
+                .any(|(value, source)| value.is_none() || source.is_none())
+        {
+            return Ok(None);
+        }
+        for (value, _) in values {
+            total = total
+                .checked_add(value.expect("checked above"))
+                .ok_or_else(|| anyhow!("measured duration overflow"))?;
+        }
+    }
+    Ok(Some(total))
+}
+
+fn activity_coverage(c: &Connection, recent_sessions: i32) -> Result<Vec<Value>> {
+    let mut stmt = c.prepare(
+        "WITH recent AS (
+           SELECT id,session_date FROM sessions ORDER BY session_date DESC,id DESC LIMIT ?1
+         )
+         SELECT ar.activity_type_key,count(DISTINCT ar.id) AS run_count,max(recent.session_date),count(a.id)
+         FROM recent JOIN activity_runs ar ON ar.session_id=recent.id
+         LEFT JOIN practice_items p ON p.activity_run_id=ar.id
+         LEFT JOIN attempts a ON a.practice_item_id=p.id
+         GROUP BY ar.activity_type_key
+         ORDER BY max(recent.session_date) DESC,ar.activity_type_key ASC",
+    )?;
+    Ok(stmt
+        .query_map([recent_sessions], |r| {
+            Ok(json!({
+                "activity_type": r.get::<_, String>(0)?,
+                "run_count": r.get::<_, i64>(1)?,
+                "last_practiced_date": r.get::<_, String>(2)?,
+                "attempt_count": r.get::<_, i64>(3)?,
+            }))
+        })?
+        .collect::<rusqlite::Result<Vec<Value>>>()?)
+}
 fn fetch_recent_prompts(c: &Connection, wid: i64, limit: i32) -> Result<Vec<String>> {
     let mut s=c.prepare("SELECT prompt FROM practice_items pi JOIN practice_item_targets t ON t.practice_item_id=pi.id WHERE t.weakness_id=?1 GROUP BY prompt ORDER BY max(created_at) DESC,prompt LIMIT ?2")?;
     Ok(s.query_map(params![wid, limit], |r| r.get(0))?
@@ -493,16 +1003,256 @@ fn recent_errors(c: &Connection, wid: i64) -> Result<Vec<Value>> {
     Ok(s.query_map([wid],|r|Ok(json!({"produced":r.get::<_,Option<String>>(0)?,"correction":r.get::<_,Option<String>>(1)?})))?.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
-fn recommendations(c: &Connection, wid: i64) -> Result<Vec<Value>> {
-    let mut stmt=c.prepare("SELECT drill_type,stage,weight FROM weakness_drill_overrides WHERE weakness_id=?1 ORDER BY weight DESC,drill_type")?;
-    let direct=stmt.query_map([wid],|r|Ok(json!({"drill_type":r.get::<_,String>(0)?,"stage":r.get::<_,String>(1)?,"weight":r.get::<_,f64>(2)?,"source":"target_override"})))?.collect::<rusqlite::Result<Vec<_>>>()?;
-    if !direct.is_empty() {
-        return Ok(direct);
+#[derive(Debug, Clone)]
+struct DrillRecommendation {
+    drill_type: DrillType,
+    stage: String,
+    weight: f64,
+    concept_distance: i64,
+    source_concept: String,
+}
+
+impl DrillRecommendation {
+    fn key(&self) -> (String, String) {
+        (self.drill_type.as_str().to_owned(), self.stage.clone())
     }
-    let mut s=c.prepare("WITH RECURSIVE linked(id,depth) AS (SELECT concept_id,0 FROM weakness_concepts WHERE weakness_id=?1 UNION SELECT e.object_id,linked.depth+1 FROM concept_edges e JOIN linked ON linked.id=e.subject_id WHERE e.predicate='broader' AND linked.depth<6) SELECT d.drill_type,d.stage,d.weight,co.key FROM linked JOIN concept_drill_recommendations d ON d.concept_id=linked.id JOIN concepts co ON co.id=linked.id ORDER BY linked.depth,d.weight DESC,d.drill_type")?;
-    let mut best: HashMap<String, Value> = HashMap::new();
-    for row in s.query_map([wid],|r|Ok(json!({"drill_type":r.get::<_,String>(0)?,"stage":r.get::<_,String>(1)?,"weight":r.get::<_,f64>(2)?,"source_concept":r.get::<_,String>(3)?})))?{let v=row?;let key=v["drill_type"].as_str().unwrap().to_owned();best.entry(key).or_insert(v);}
-    Ok(best.into_values().collect())
+    fn json(&self) -> Value {
+        let mut value = json!({
+            "drill_type": self.drill_type.as_str(),
+            "stage": self.stage,
+            "weight": self.weight,
+            "source_concept": self.source_concept,
+        });
+        if self.source_concept == "target_override" {
+            value["source"] = json!("target_override");
+        }
+        value
+    }
+}
+
+fn recommendation_from_row(
+    drill_type: String,
+    stage: String,
+    weight: f64,
+    concept_distance: i64,
+    source_concept: String,
+) -> Result<DrillRecommendation> {
+    let drill_type = serde_json::from_value::<DrillType>(Value::String(drill_type))?;
+    Ok(DrillRecommendation {
+        drill_type,
+        stage,
+        weight,
+        concept_distance,
+        source_concept,
+    })
+}
+
+fn keep_better_recommendation(
+    recommendations: &mut HashMap<(String, String), DrillRecommendation>,
+    candidate: DrillRecommendation,
+) {
+    let key = candidate.key();
+    let replace = recommendations.get(&key).is_none_or(|current| {
+        candidate.weight > current.weight
+            || (candidate.weight == current.weight
+                && (candidate.concept_distance, &candidate.source_concept)
+                    < (current.concept_distance, &current.source_concept))
+    });
+    if replace {
+        recommendations.insert(key, candidate);
+    }
+}
+
+fn recommendations(c: &Connection, wid: i64) -> Result<Vec<DrillRecommendation>> {
+    let mut best = HashMap::new();
+    let mut stmt = c.prepare(
+        "SELECT drill_type,stage,weight FROM weakness_drill_overrides WHERE weakness_id=?1",
+    )?;
+    for row in stmt.query_map([wid], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, f64>(2)?,
+        ))
+    })? {
+        let (drill, stage, weight) = row?;
+        keep_better_recommendation(
+            &mut best,
+            recommendation_from_row(drill, stage, weight, 0, "target_override".to_owned())?,
+        );
+    }
+    if best.is_empty() {
+        let mut s = c.prepare(
+            "WITH RECURSIVE linked(id,depth) AS (
+               SELECT concept_id,0 FROM weakness_concepts WHERE weakness_id=?1
+               UNION
+               SELECT e.object_id,linked.depth+1 FROM concept_edges e JOIN linked
+                 ON linked.id=e.subject_id WHERE e.predicate='broader' AND linked.depth<6
+             )
+             SELECT d.drill_type,d.stage,d.weight,linked.depth,co.key
+             FROM linked JOIN concept_drill_recommendations d ON d.concept_id=linked.id
+             JOIN concepts co ON co.id=linked.id
+             ORDER BY linked.depth,d.weight DESC,d.drill_type,d.stage,co.key",
+        )?;
+        for row in s.query_map([wid], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, f64>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, String>(4)?,
+            ))
+        })? {
+            let (drill, stage, weight, distance, concept) = row?;
+            keep_better_recommendation(
+                &mut best,
+                recommendation_from_row(drill, stage, weight, distance, concept)?,
+            );
+        }
+    }
+    let mut result = best.into_values().collect::<Vec<_>>();
+    result.sort_by(|a, b| {
+        b.weight
+            .partial_cmp(&a.weight)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.drill_type.as_str().cmp(b.drill_type.as_str()))
+            .then_with(|| a.stage.cmp(&b.stage))
+    });
+    Ok(result)
+}
+
+fn general_fallback_recommendations() -> Vec<DrillRecommendation> {
+    [
+        (DrillType::MinimalPairChoice, "recognition"),
+        (DrillType::ErrorCorrection, "recognition"),
+        (DrillType::Translation, "controlled"),
+        (DrillType::SentenceTransformation, "controlled"),
+        (DrillType::SentenceCompletion, "controlled"),
+        (DrillType::SentenceCombining, "controlled"),
+        (DrillType::SituationalResponse, "transfer"),
+        (DrillType::QuestionAnswer, "transfer"),
+        (DrillType::DialogueCompletion, "controlled"),
+        (DrillType::MicroStory, "transfer"),
+        (DrillType::Retell, "transfer"),
+        (DrillType::Fluency432, "fluency"),
+    ]
+    .into_iter()
+    .map(|(drill_type, stage)| DrillRecommendation {
+        drill_type,
+        stage: stage.to_owned(),
+        weight: 1.0,
+        concept_distance: i64::MAX,
+        source_concept: "fallback".to_owned(),
+    })
+    .collect()
+}
+
+fn activity_fallback_recommendations(activity_type: ActivityType) -> Vec<DrillRecommendation> {
+    activities::activity_spec(activity_type)
+        .compatible_drills
+        .iter()
+        .copied()
+        .map(|drill_type| DrillRecommendation {
+            drill_type,
+            stage: if matches!(
+                drill_type,
+                DrillType::SentenceTransformation | DrillType::DialogueCompletion
+            ) {
+                "controlled"
+            } else {
+                "transfer"
+            }
+            .to_owned(),
+            weight: 1.0,
+            concept_distance: i64::MAX,
+            source_concept: "activity_fallback".to_owned(),
+        })
+        .collect()
+}
+
+fn eligible_recommendations(
+    activity_type: Option<ActivityType>,
+    mix: DrillMix,
+    allowed: Option<&[DrillType]>,
+    database: Vec<DrillRecommendation>,
+) -> Result<Vec<DrillRecommendation>> {
+    if activity_type.is_some()
+        && matches!(
+            mix,
+            DrillMix::TranslationOnly | DrillMix::RecognitionToProduction | DrillMix::Fluency
+        )
+    {
+        bail!("drill_mix {:?} is incompatible with activity requests", mix)
+    }
+    if matches!(mix, DrillMix::Custom) && allowed.is_none_or(<[DrillType]>::is_empty) {
+        bail!("allowed_drill_types is required for custom drill_mix")
+    }
+    let mut result = if let Some(activity) = activity_type {
+        let mut compatible = database
+            .into_iter()
+            .filter(|recommendation| {
+                activities::activity_spec(activity)
+                    .compatible_drills
+                    .contains(&recommendation.drill_type)
+            })
+            .collect::<Vec<_>>();
+        if compatible.is_empty() {
+            compatible = activity_fallback_recommendations(activity);
+        }
+        compatible
+    } else if database.is_empty() {
+        general_fallback_recommendations()
+    } else {
+        database
+    };
+    if let Some(allowed) = allowed {
+        result.retain(|recommendation| allowed.contains(&recommendation.drill_type));
+    }
+    match mix {
+        DrillMix::Auto => {}
+        DrillMix::ProductionFocused => result.retain(|recommendation| {
+            matches!(
+                recommendation.drill_type,
+                DrillType::SituationalResponse
+                    | DrillType::SentenceTransformation
+                    | DrillType::QuestionAnswer
+                    | DrillType::DialogueCompletion
+                    | DrillType::MicroStory
+                    | DrillType::Retell
+                    | DrillType::SentenceCombining
+                    | DrillType::SentenceCompletion
+            )
+        }),
+        DrillMix::TranslationOnly => {
+            result.retain(|recommendation| recommendation.drill_type == DrillType::Translation)
+        }
+        DrillMix::RecognitionToProduction => {
+            if !result.iter().any(|x| x.stage == "recognition")
+                || !result
+                    .iter()
+                    .any(|x| matches!(x.stage.as_str(), "controlled" | "transfer" | "fluency"))
+            {
+                bail!("recognition_to_production requires recognition and production drills")
+            }
+        }
+        DrillMix::Fluency => {
+            result.retain(|recommendation| recommendation.drill_type == DrillType::Fluency432)
+        }
+        DrillMix::Custom => {}
+    }
+    result.sort_by(|a, b| {
+        b.weight
+            .partial_cmp(&a.weight)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.drill_type.as_str().cmp(b.drill_type.as_str()))
+            .then_with(|| a.stage.cmp(&b.stage))
+    });
+    if result.is_empty() {
+        bail!(
+            "no drill recommendation satisfies the requested activity, mix, and allowed_drill_types constraints"
+        )
+    }
+    Ok(result)
 }
 
 #[async_trait]
@@ -528,15 +1278,53 @@ impl LearningStore for SqliteStore {
         let full = matches!(request.detail, Some(DetailMode::Full));
         let weaknesses=rows.into_iter().map(|r|Ok(json!({"key":r.key,"category":r.category,"description":r.description,"target_pattern":r.target_pattern,"first_seen":r.first_seen,"last_seen":r.last_seen,"classification":classification(&c,r.id,full)?,"fsrs":fsrs_json(&r,day,&cfg)?,"incorrect_count":r.incorrect_count,"correct_count":r.correct_count,"observation_count":r.observation_count,"recent_prompts":fetch_recent_prompts(&c,r.id,if full{4}else{2})?}))).collect::<Result<Vec<_>>>()?;
         let n = i32::from(request.recent_sessions.unwrap_or(5).clamp(1, 20));
-        let mut s=c.prepare("SELECT id,session_date,exercise_type,exercise_type_key,topic,notes,(SELECT count(*) FROM attempts a WHERE a.session_id=s.id),(SELECT count(*) FROM observations o WHERE o.session_id=s.id),(SELECT count(*) FROM practice_items p WHERE p.session_id=s.id) FROM sessions s ORDER BY session_date DESC,id DESC LIMIT ?1")?;
-        let sessions=s.query_map([n],|r|Ok(json!({"id":r.get::<_,i64>(0)?,"session_date":r.get::<_,String>(1)?,"exercise_type":r.get::<_,String>(2)?,"exercise_type_key":r.get::<_,Option<String>>(3)?,"topic":r.get::<_,Option<String>>(4)?,"notes":r.get::<_,Option<String>>(5)?,"attempt_count":r.get::<_,i64>(6)?,"observation_count":r.get::<_,i64>(7)?,"item_count":r.get::<_,i64>(8)?})))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut s=c.prepare("SELECT id,session_date,exercise_type_key,topic,notes,(SELECT count(*) FROM attempts a WHERE a.session_id=s.id),(SELECT count(*) FROM observations o WHERE o.session_id=s.id),(SELECT count(*) FROM practice_items p WHERE p.session_id=s.id) FROM sessions s ORDER BY session_date DESC,id DESC LIMIT ?1")?;
+        let session_rows = s
+            .query_map([n], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, i64>(5)?,
+                    r.get::<_, i64>(6)?,
+                    r.get::<_, i64>(7)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let sessions = session_rows
+            .into_iter()
+            .map(
+                |(id, date, key, topic, notes, attempt_count, observation_count, item_count)| {
+                    let exercise_type_key = exercise_type_from_db(&key)?;
+                    Ok(json!({
+                        "id": id,
+                        "session_date": date,
+                        "exercise_type_key": exercise_type_key,
+                        "exercise_type_label": exercise_type_key.label(),
+                        "topic": topic,
+                        "notes": notes,
+                        "attempt_count": attempt_count,
+                        "observation_count": observation_count,
+                        "item_count": item_count
+                    }))
+                },
+            )
+            .collect::<Result<Vec<_>>>()?;
         Ok(
-            json!({"as_of":day.to_string(),"active_weaknesses":weaknesses,"recent_sessions":sessions,"scheduler":{"algorithm":cfg.algorithm,"algorithm_version":cfg.algorithm_version,"desired_retention":cfg.desired_retention,"parameter_set_id":cfg.parameter_set_id,"parameters_source":cfg.source}}),
+            json!({"as_of":day.to_string(),"active_weaknesses":weaknesses,"recent_sessions":sessions,"activity_coverage":activity_coverage(&c,n)?,"scheduler":{"algorithm":cfg.algorithm,"algorithm_version":cfg.algorithm_version,"desired_retention":cfg.desired_retention,"parameter_set_id":cfg.parameter_set_id,"parameters_source":cfg.source}}),
         )
     }
 
     async fn recent_practice(&self, request: RecentPracticeRequest) -> Result<Value> {
         let c = self.conn()?;
+        if request.activity_types.as_ref().is_some_and(Vec::is_empty) {
+            bail!("activity_types must not be an empty list")
+        }
+        if request.response_modes.as_ref().is_some_and(Vec::is_empty) {
+            bail!("response_modes must not be an empty list")
+        }
         let full = matches!(request.detail, Some(DetailMode::Full));
         let include_items = request.include_items.unwrap_or(full);
         let include_attempts = request.include_attempts.unwrap_or(full);
@@ -556,7 +1344,7 @@ impl LearningStore for SqliteStore {
         {
             bail!("from_date must not be after to_date")
         }
-        let mut sql="SELECT DISTINCT s.id,s.session_date,s.exercise_type,s.exercise_type_key,s.topic,s.notes FROM sessions s WHERE 1=1".to_owned();
+        let mut sql="SELECT DISTINCT s.id,s.session_date,s.exercise_type_key,s.topic,s.notes FROM sessions s WHERE 1=1".to_owned();
         let mut vals: Vec<SqlValue> = Vec::new();
         let target_union = "(SELECT o.weakness_id FROM observations o WHERE o.session_id=s.id UNION SELECT t.weakness_id FROM practice_item_targets t JOIN practice_items p ON p.id=t.practice_item_id WHERE p.session_id=s.id)";
         if let Some(v) = from {
@@ -567,15 +1355,48 @@ impl LearningStore for SqliteStore {
             sql.push_str(" AND s.session_date<=?");
             vals.push(v.to_string().into())
         }
-        if let Some(v) = request.exercise_types.as_ref().filter(|v| !v.is_empty()) {
-            sql.push_str(" AND s.exercise_type IN (");
+        if let Some(v) = request
+            .exercise_type_keys
+            .as_ref()
+            .filter(|v| !v.is_empty())
+        {
+            sql.push_str(" AND s.exercise_type_key IN (");
             sql.push_str(
                 &std::iter::repeat_n("?", v.len())
                     .collect::<Vec<_>>()
                     .join(","),
             );
             sql.push(')');
-            vals.extend(v.iter().cloned().map(SqlValue::from));
+            vals.extend(
+                v.iter()
+                    .map(|value| SqlValue::from(value.as_str().to_owned())),
+            );
+        }
+        if let Some(v) = request.activity_types.as_ref().filter(|v| !v.is_empty()) {
+            sql.push_str(" AND EXISTS(SELECT 1 FROM activity_runs ar WHERE ar.session_id=s.id AND ar.activity_type_key IN (");
+            sql.push_str(
+                &std::iter::repeat_n("?", v.len())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+            sql.push_str("))");
+            vals.extend(
+                v.iter()
+                    .map(|value| SqlValue::from(value.as_str().to_owned())),
+            );
+        }
+        if let Some(v) = request.response_modes.as_ref().filter(|v| !v.is_empty()) {
+            sql.push_str(" AND EXISTS(SELECT 1 FROM attempts a2 WHERE a2.session_id=s.id AND a2.response_mode IN (");
+            sql.push_str(
+                &std::iter::repeat_n("?", v.len())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+            sql.push_str("))");
+            vals.extend(
+                v.iter()
+                    .map(|value| SqlValue::from(value.as_str().to_owned())),
+            );
         }
         if let Some(v) = request.drill_types.as_ref().filter(|v| !v.is_empty()) {
             sql.push_str(" AND EXISTS(SELECT 1 FROM practice_items p WHERE p.session_id=s.id AND p.drill_type IN (");
@@ -668,7 +1489,7 @@ impl LearningStore for SqliteStore {
             vals.extend(types.into_iter().map(SqlValue::from));
         }
         if let Some(skill) = request.skill.as_deref() {
-            sql.push_str(" AND (s.exercise_type LIKE ? OR COALESCE(s.topic,'') LIKE ? OR EXISTS(SELECT 1 FROM observations o JOIN weaknesses w ON w.id=o.weakness_id WHERE o.session_id=s.id AND (w.key=? OR w.category=?)))");
+            sql.push_str(" AND (s.exercise_type_key LIKE ? OR COALESCE(s.topic,'') LIKE ? OR EXISTS(SELECT 1 FROM observations o JOIN weaknesses w ON w.id=o.weakness_id WHERE o.session_id=s.id AND (w.key=? OR w.category=?)))");
             let p = format!("%{skill}%");
             vals.extend(
                 [p.clone(), p, skill.to_owned(), skill.to_owned()]
@@ -687,15 +1508,40 @@ impl LearningStore for SqliteStore {
                     r.get::<_, String>(2)?,
                     r.get::<_, Option<String>>(3)?,
                     r.get::<_, Option<String>>(4)?,
-                    r.get::<_, Option<String>>(5)?,
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let mut result = Vec::new();
-        for (sid, date, kind, type_key, topic, notes) in sessions {
-            let mut item = json!({"id":sid,"session_date":date,"exercise_type":kind,"exercise_type_key":type_key,"topic":topic,"notes":notes});
+        for (sid, date, type_key, topic, notes) in sessions {
+            let exercise_type_key = exercise_type_from_db(&type_key)?;
+            let mut item = json!({"id":sid,"session_date":date,"exercise_type_key":exercise_type_key,"exercise_type_label":exercise_type_key.label(),"topic":topic,"notes":notes});
+            let activity_types = activity_types_for_session(&c, sid)?;
+            let run_count: i64 = c.query_row(
+                "SELECT count(*) FROM activity_runs WHERE session_id=?1",
+                [sid],
+                |r| r.get(0),
+            )?;
+            let item_count: i64 = c.query_row(
+                "SELECT count(*) FROM practice_items WHERE session_id=?1",
+                [sid],
+                |r| r.get(0),
+            )?;
+            let attempt_count: i64 = c.query_row(
+                "SELECT count(*) FROM attempts WHERE session_id=?1",
+                [sid],
+                |r| r.get(0),
+            )?;
+            item["activity_types"] = json!(activity_types);
+            item["activity_run_count"] = json!(run_count);
+            item["item_count"] = json!(item_count);
+            item["attempt_count"] = json!(attempt_count);
+            item["total_measured_duration_milliseconds"] =
+                json!(session_measured_duration(&c, sid)?);
+            if include_items || include_attempts {
+                item["activity_runs"] = json!(activity_runs_json(&c, sid)?);
+            }
             if include_items {
-                let mut q=c.prepare("SELECT id,item_no,drill_type,prompt,response,corrected_response,reference_answer,feedback,outcome FROM practice_items WHERE session_id=?1 ORDER BY item_no")?;
+                let mut q=c.prepare("SELECT id,item_no,drill_type,prompt,response,corrected_response,reference_answer,feedback,outcome,activity_run_id,item_phase FROM practice_items WHERE session_id=?1 ORDER BY item_no")?;
                 let mut arr = Vec::new();
                 for row in q.query_map([sid], |r| {
                     Ok((
@@ -708,12 +1554,25 @@ impl LearningStore for SqliteStore {
                         r.get::<_, Option<String>>(6)?,
                         r.get::<_, Option<String>>(7)?,
                         r.get::<_, Option<String>>(8)?,
+                        r.get::<_, Option<i64>>(9)?,
+                        r.get::<_, String>(10)?,
                     ))
                 })? {
-                    let (iid, no, drill, prompt, response, corrected, reference, feedback, outcome) =
-                        row?;
+                    let (
+                        iid,
+                        no,
+                        drill,
+                        prompt,
+                        response,
+                        corrected,
+                        reference,
+                        feedback,
+                        outcome,
+                        run_id,
+                        phase,
+                    ) = row?;
                     let targets:Vec<String>=c.prepare("SELECT w.key FROM practice_item_targets t JOIN weaknesses w ON w.id=t.weakness_id WHERE t.practice_item_id=?1 ORDER BY w.key")?.query_map([iid],|r|r.get(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
-                    let mut v = json!({"item_no":no,"drill_type":drill,"prompt":prompt,"prompt_fingerprint":c.query_row("SELECT prompt_fingerprint FROM practice_items WHERE id=?1",[iid],|r|r.get::<_,Option<String>>(0))?,"response":response,"corrected_response":corrected,"reference_answer":reference,"feedback":feedback,"outcome":outcome,"target_weakness_keys":targets});
+                    let mut v = json!({"item_no":no,"drill_type":drill,"prompt":prompt,"prompt_fingerprint":c.query_row("SELECT prompt_fingerprint FROM practice_items WHERE id=?1",[iid],|r|r.get::<_,Option<String>>(0))?,"response":response,"corrected_response":corrected,"reference_answer":reference,"feedback":feedback,"outcome":outcome,"activity_run_no":run_id.and_then(|id|c.query_row("SELECT run_no FROM activity_runs WHERE id=?1",[id],|r|r.get::<_,i64>(0)).ok()),"item_phase":phase,"target_weakness_keys":targets});
                     if include_observations {
                         v["observations"] = json!(observation_json(&c, sid, None, Some(iid))?);
                     }
@@ -722,7 +1581,7 @@ impl LearningStore for SqliteStore {
                 item["items"] = json!(arr);
             }
             if include_attempts {
-                let mut q=c.prepare("SELECT id,attempt_no,practice_item_id,transcript,target_duration_seconds,actual_duration_milliseconds,created_at FROM attempts WHERE session_id=?1 ORDER BY attempt_no")?;
+                let mut q=c.prepare("SELECT id,attempt_no,practice_item_id,transcript,target_duration_seconds,actual_duration_milliseconds,response_mode,response_latency_milliseconds,timing_source,created_at FROM attempts WHERE session_id=?1 ORDER BY attempt_no")?;
                 let mut arr = Vec::new();
                 for row in q.query_map([sid], |r| {
                     Ok((
@@ -732,11 +1591,26 @@ impl LearningStore for SqliteStore {
                         r.get::<_, String>(3)?,
                         r.get::<_, Option<i64>>(4)?,
                         r.get::<_, Option<i64>>(5)?,
-                        r.get::<_, String>(6)?,
+                        r.get::<_, Option<String>>(6)?,
+                        r.get::<_, Option<i64>>(7)?,
+                        r.get::<_, Option<String>>(8)?,
+                        r.get::<_, String>(9)?,
                     ))
                 })? {
-                    let (aid, no, iid, transcript, target, actual, created) = row?;
-                    let mut v = json!({"attempt_no":no,"practice_item_no":iid.and_then(|id|c.query_row("SELECT item_no FROM practice_items WHERE id=?1",[id],|r|r.get::<_,i64>(0)).ok()),"transcript":transcript,"target_duration_seconds":target,"actual_duration_milliseconds":actual,"created_at":created});
+                    let (
+                        aid,
+                        no,
+                        iid,
+                        transcript,
+                        target,
+                        actual,
+                        response_mode,
+                        latency,
+                        timing_source,
+                        created,
+                    ) = row?;
+                    let reflections = c.prepare("SELECT reflection_no,source,kind,note,created_at FROM attempt_reflections WHERE attempt_id=?1 ORDER BY reflection_no")?.query_map([aid],|r|Ok(json!({"reflection_no":r.get::<_,i64>(0)?,"source":r.get::<_,String>(1)?,"kind":r.get::<_,String>(2)?,"note":r.get::<_,String>(3)?,"created_at":r.get::<_,String>(4)?})))?.collect::<rusqlite::Result<Vec<_>>>()?;
+                    let mut v = json!({"attempt_no":no,"practice_item_no":iid.and_then(|id|c.query_row("SELECT item_no FROM practice_items WHERE id=?1",[id],|r|r.get::<_,i64>(0)).ok()),"transcript":transcript,"target_duration_seconds":target,"actual_duration_milliseconds":actual,"response_mode":response_mode,"response_latency_milliseconds":latency,"timing_source":timing_source,"reflections":reflections,"created_at":created});
                     if include_observations {
                         v["observations"] = json!(observation_json(&c, sid, Some(aid), None)?);
                     }
@@ -752,28 +1626,74 @@ impl LearningStore for SqliteStore {
         Ok(json!({"items":result}))
     }
 
-    async fn record_practice_json(&self, payload: Value) -> Result<Value> {
-        let x: RecordPracticeSessionRequest = serde_json::from_value(payload.clone())?;
-        let request_hash = hash_payload(&payload)?;
+    async fn record_practice(
+        &self,
+        x: RecordPracticeSessionRequest,
+    ) -> std::result::Result<RecordPracticeSessionResponse, RecordPracticeError> {
+        validate_record_practice_request(&x)?;
+        let request_bytes = serde_json::to_vec(&x)?;
+        if request_bytes.len() > 65_536 {
+            return Err(RecordPracticeError::invalid(
+                "serialized practice session must be at most 64 KiB",
+            ));
+        }
+        let request_hash = hash_bytes(&request_bytes);
         let mut c = self.conn()?;
         let tx = c.transaction()?;
-        if let Some((sid,hash,replayable,response))=tx.query_row("SELECT session_id,request_hash,replayable,response_json FROM recorded_requests WHERE idempotency_key=?1",[&x.idempotency_key],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?,r.get::<_,String>(3)?))).optional()?{if replayable==0{bail!("legacy idempotency record cannot be replayed")};if hash!=request_hash{bail!("idempotency_key was already used with a different payload")};let mut out:Value=serde_json::from_str(&response)?;out["recorded"]=json!(false);out["idempotent_replay"]=json!(true);out["session_id"]=json!(sid);return Ok(out)}
-        evidence::validate_session_observation_numbers(&x)?;
+        if let Some((sid, hash, replayable, response)) = tx
+            .query_row(
+                "SELECT session_id,request_hash,replayable,response_json FROM recorded_requests WHERE idempotency_key=?1",
+                [&x.idempotency_key],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()?
+        {
+            if replayable == 0 {
+                return Err(RecordPracticeError::internal(anyhow!(
+                    "non-replayable idempotency row remains after schema migration"
+                )));
+            }
+            if hash != request_hash {
+                return Err(RecordPracticeError::IdempotencyConflict);
+            }
+            let mut out: RecordPracticeSessionResponse = serde_json::from_str(&response)?;
+            if out.session_id != sid {
+                return Err(RecordPracticeError::internal(anyhow!(
+                    "recorded response session_id does not match idempotency ledger"
+                )));
+            }
+            out.status = RecordStatus::Replayed;
+            return Ok(out);
+        }
         let cfg = scheduler_config(&tx)?;
-        let (reviewed_at, review_dt) = normalized_timestamp(x.reviewed_at.as_deref())?;
+        let (reviewed_at, review_dt) = normalized_timestamp(x.reviewed_at.as_deref())
+            .map_err(|error| RecordPracticeError::invalid(error.to_string()))?;
         let review_day = learning_day(review_dt, &cfg.timezone, cfg.cutoff)?;
         let today = learning_day(now_utc(), &cfg.timezone, cfg.cutoff)?;
         let date = x
             .session_date
             .clone()
             .unwrap_or_else(|| review_day.to_string());
-        let session_day = valid_date(&date, "session_date")?;
+        let session_day = valid_date(&date, "session_date")
+            .map_err(|error| RecordPracticeError::invalid(error.to_string()))?;
         if x.reviewed_at.is_none() && session_day != today {
-            bail!("backdated or future session_date requires reviewed_at")
+            return Err(RecordPracticeError::invalid(
+                "backdated or future session_date requires reviewed_at",
+            ));
         }
         if x.reviewed_at.is_some() && session_day != review_day {
-            bail!("session_date must match the learning day of reviewed_at")
+            return Err(RecordPracticeError::invalid(
+                "session_date must match the learning day of reviewed_at",
+            ));
         }
+        validate_record_database_references(&tx, &x)?;
         let declared = x
             .items
             .iter()
@@ -783,29 +1703,83 @@ impl LearningStore for SqliteStore {
         let mut new_keys = HashSet::new();
         for w in &x.new_weaknesses {
             if !new_keys.insert(w.key.clone()) {
-                bail!("duplicate new weakness key: {}", w.key)
+                return Err(RecordPracticeError::invalid(format!(
+                    "duplicate new weakness key: {}",
+                    w.key
+                )));
             };
-            let (_, was_created) = upsert_weakness_tx(&tx, w, declared.contains(&w.key), true)?;
+            let (_, was_created) =
+                upsert_weakness_tx(&tx, w, declared.contains(&w.key), true, false)?;
             if was_created {
                 created.push(w.key.clone())
             }
         }
-        for key in all_weakness_keys(&x) {
-            if !weakness_exists(&tx, &key)? {
-                bail!("unknown weakness key: {key}")
+        for weakness in &x.new_weaknesses {
+            for relation in &weakness.target_relations {
+                insert_target_relation(&tx, &weakness.key, relation)?;
             }
         }
-        let (type_key, type_label) = resolve_exercise_type(
-            &tx,
-            x.exercise_type_key
-                .as_deref()
-                .or(Some(x.exercise_type.as_str())),
+        for key in all_weakness_keys(&x) {
+            if !weakness_exists(&tx, &key)? {
+                return Err(RecordPracticeError::unknown(format!(
+                    "weakness_key \"{key}\" does not exist and is not declared in new_weaknesses"
+                )));
+            }
+        }
+        let type_key = x.exercise_type_key;
+        let type_label = type_key.label();
+        tx.execute(
+            "INSERT INTO sessions(session_date,exercise_type_key,topic,notes) VALUES(?1,?2,?3,?4)",
+            params![date, type_key.as_str(), x.topic, x.notes],
         )?;
-        tx.execute("INSERT INTO sessions(session_date,exercise_type,exercise_type_key,topic,notes) VALUES(?1,?2,?3,?4,?5)",params![date,type_label,type_key,x.topic,x.notes])?;
         let sid = tx.last_insert_rowid();
+        let mut run_ids = HashMap::new();
+        for run in &x.activity_runs {
+            let config_json = run
+                .config
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?
+                .unwrap_or_else(|| "{}".to_owned());
+            tx.execute(
+                "INSERT INTO activity_runs(session_id,run_no,activity_type_key,planned_duration_seconds,actual_duration_milliseconds,timing_source,config_json,notes) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                params![
+                    sid,
+                    run.run_no,
+                    run.activity_type.as_str(),
+                    run.planned_duration_seconds,
+                    run.actual_duration_milliseconds
+                        .map(i64::try_from)
+                        .transpose()
+                        .map_err(|_| anyhow!("activity duration overflow"))?,
+                    run.timing_source.map(|value| value.as_str()),
+                    config_json,
+                    run.notes,
+                ],
+            )?;
+            let run_id = tx.last_insert_rowid();
+            run_ids.insert(run.run_no, run_id);
+            for stimulus in &run.stimuli {
+                tx.execute(
+                    "INSERT INTO activity_stimuli(activity_run_id,stimulus_no,kind,delivery_mode,content_text,source_uri,content_fingerprint) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                    params![
+                        run_id,
+                        stimulus.stimulus_no,
+                        stimulus.kind.as_str(),
+                        stimulus.delivery_mode.as_str(),
+                        stimulus.content_text,
+                        stimulus.source_uri,
+                        stimulus_fingerprint(
+                            stimulus.content_text.as_deref(),
+                            stimulus.source_uri.as_deref()
+                        ),
+                    ],
+                )?;
+            }
+        }
         let mut item_ids = HashMap::new();
         for item in &x.items {
-            tx.execute("INSERT INTO practice_items(session_id,item_no,drill_type,prompt,prompt_fingerprint,response,corrected_response,reference_answer,feedback,outcome) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",params![sid,item.item_no,item.drill_type.as_str(),item.prompt,prompt_fingerprint(&item.prompt),item.response,item.corrected_response,item.reference_answer,item.feedback,item.outcome.as_ref().map(serialize_enum).transpose()?])?;
+            tx.execute("INSERT INTO practice_items(session_id,item_no,drill_type,prompt,prompt_fingerprint,response,corrected_response,reference_answer,feedback,outcome,activity_run_id,item_phase) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",params![sid,item.item_no,item.drill_type.as_str(),item.prompt,prompt_fingerprint(&item.prompt),item.response,item.corrected_response,item.reference_answer,item.feedback,item.outcome.as_ref().map(serialize_enum).transpose()?,item.activity_run_no.and_then(|no|run_ids.get(&no)).copied(),item.item_phase.unwrap_or(crate::model::ActivityItemPhase::Initial).as_str()])?;
             let iid = tx.last_insert_rowid();
             item_ids.insert(item.item_no, iid);
             for key in &item.target_weakness_keys {
@@ -816,8 +1790,20 @@ impl LearningStore for SqliteStore {
         let mut observation_ids = HashMap::new();
         for a in &x.attempts {
             let iid = a.practice_item_no.and_then(|n| item_ids.get(&n)).copied();
-            tx.execute("INSERT INTO attempts(session_id,attempt_no,practice_item_id,transcript,target_duration_seconds,actual_duration_milliseconds) VALUES(?1,?2,?3,?4,?5,?6)",params![sid,a.attempt_no,iid,a.transcript,a.target_duration_seconds,a.actual_duration_milliseconds.map(i64::try_from).transpose().map_err(|_|anyhow!("actual duration overflow"))?])?;
+            tx.execute("INSERT INTO attempts(session_id,attempt_no,practice_item_id,transcript,target_duration_seconds,actual_duration_milliseconds,response_mode,response_latency_milliseconds,timing_source) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",params![sid,a.attempt_no,iid,a.transcript,a.target_duration_seconds,a.actual_duration_milliseconds.map(i64::try_from).transpose().map_err(|_|anyhow!("actual duration overflow"))?,a.response_mode.map(|value|value.as_str()),a.response_latency_milliseconds.map(i64::try_from).transpose().map_err(|_|anyhow!("response latency overflow"))?,a.timing_source.map(|value|value.as_str())])?;
             let aid = tx.last_insert_rowid();
+            for reflection in &a.reflections {
+                tx.execute(
+                    "INSERT INTO attempt_reflections(attempt_id,reflection_no,source,kind,note) VALUES(?1,?2,?3,?4,?5)",
+                    params![
+                        aid,
+                        reflection.reflection_no,
+                        reflection.source.as_str(),
+                        reflection.kind.as_str(),
+                        reflection.note,
+                    ],
+                )?;
+            }
             for o in &a.observations {
                 insert_observation(&tx, sid, Some(aid), iid, o, &mut observation_ids)?;
             }
@@ -844,21 +1830,32 @@ impl LearningStore for SqliteStore {
         let mut review_updates = Vec::new();
         for review in &x.reviews {
             if !review_keys.insert(review.weakness_key.clone()) {
-                bail!("only one FSRS review per weakness is allowed in a session")
+                return Err(RecordPracticeError::invalid(
+                    "only one FSRS review per weakness is allowed in a session",
+                ));
             };
-            let row = load_one_weakness_tx(&tx, &review.weakness_key)?
-                .ok_or_else(|| anyhow!("unknown weakness key: {}", review.weakness_key))?;
-            if !has_target(&tx, sid, &review.weakness_key) {
-                bail!(
-                    "FSRS review must target a declared practice item: {}",
+            let row = load_one_weakness_tx(&tx, &review.weakness_key)?.ok_or_else(|| {
+                RecordPracticeError::unknown(format!(
+                    "reviews weakness_key \"{}\" does not exist",
                     review.weakness_key
-                )
+                ))
+            })?;
+            if !has_target(&tx, sid, &review.weakness_key) {
+                return Err(RecordPracticeError::invalid(format!(
+                    "reviews weakness_key \"{}\" must target a declared practice item",
+                    review.weakness_key
+                )));
             };
-            let initial = validate_review_evidence(&tx, sid, &row, review, &observation_ids)?;
+            let initial = validate_review_evidence(&tx, sid, &row, review, &observation_ids)
+                .map_err(|error| RecordPracticeError::invalid(error.to_string()))?;
             let prior = match (row.stability, row.difficulty, row.last_review.as_deref()) {
                 (Some(s), Some(d), Some(_)) => Some(fsrs_adapter::memory_state(s, d)?),
                 (None, None, None) => None,
-                _ => bail!("scheduler item has incomplete state"),
+                _ => {
+                    return Err(RecordPracticeError::internal(anyhow!(
+                        "scheduler item has incomplete state"
+                    )));
+                }
             };
             let elapsed = match row.last_review.as_deref() {
                 Some(last) => learning_day_delta(last, &reviewed_at, &cfg.timezone, cfg.cutoff)?,
@@ -876,11 +1873,7 @@ impl LearningStore for SqliteStore {
                 &cfg.parameters,
             )?;
             let due = review_day + Duration::days(i64::from(scheduled.interval_days));
-            let evidence = if review.evidence.is_null() {
-                json!({})
-            } else {
-                review.evidence.clone()
-            };
+            let evidence = Value::Object(review.evidence.clone());
             let evidence_json = serde_json::to_string(&evidence)?;
             tx.execute("INSERT INTO weakness_reviews(scheduler_item_id,session_id,reviewed_at,review_learning_day,rating,rating_source,rating_rationale,retrieval_mode,evidence_strength,evidence_json,elapsed_days,desired_retention,retrievability_before,stability_before,difficulty_before,stability_after,difficulty_after,scheduled_interval_days,due_learning_day,algorithm,algorithm_version,parameter_set_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)",params![row.scheduler_id, sid,reviewed_at,review_day.to_string(),review.rating.number(),review.rating_source.as_str(),review.rating_rationale,review.retrieval_mode.as_str(),serialize_enum(&review.evidence_strength)?,evidence_json,elapsed,cfg.desired_retention,before,prior.map(|p|f64::from(p.stability)),prior.map(|p|f64::from(p.difficulty)),f64::from(scheduled.memory.stability),f64::from(scheduled.memory.difficulty),scheduled.interval_days,due.to_string(),cfg.algorithm,cfg.algorithm_version,cfg.parameter_set_id])?;
             let rid = tx.last_insert_rowid();
@@ -888,9 +1881,36 @@ impl LearningStore for SqliteStore {
                 tx.execute("INSERT INTO review_observations(review_id,observation_id,evidence_role) VALUES(?1,?2,?3)",params![rid,observation_ids[&no],role])?;
             }
             tx.execute("UPDATE scheduler_items SET stability=?1,difficulty=?2,due_learning_day=?3,last_review_at=?4,algorithm_version=?5,parameter_set_id=?6 WHERE id=?7",params![f64::from(scheduled.memory.stability),f64::from(scheduled.memory.difficulty),due.to_string(),reviewed_at,cfg.algorithm_version,cfg.parameter_set_id,row.scheduler_id])?;
-            review_updates.push(json!({"weakness_key":review.weakness_key,"rating":rating_name(review.rating.number()),"retrievability_before":before,"stability_before":prior.map(|p|f64::from(p.stability)),"stability_after":f64::from(scheduled.memory.stability),"difficulty_before":prior.map(|p|f64::from(p.difficulty)),"difficulty_after":f64::from(scheduled.memory.difficulty),"scheduled_interval_days":scheduled.interval_days,"due_learning_day":due.to_string()}));
+            review_updates.push(ReviewUpdate {
+                weakness_key: review.weakness_key.clone(),
+                rating: rating_name(review.rating.number()).to_owned(),
+                retrievability_before: before,
+                stability_before: prior.map(|p| f64::from(p.stability)),
+                stability_after: f64::from(scheduled.memory.stability),
+                difficulty_before: prior.map(|p| f64::from(p.difficulty)),
+                difficulty_after: f64::from(scheduled.memory.difficulty),
+                scheduled_interval_days: scheduled.interval_days,
+                due_learning_day: due.to_string(),
+            });
         }
-        let response = json!({"session_id":sid,"recorded":true,"idempotent_replay":false,"exercise_type_key":type_key,"exercise_type_label":type_label,"item_count":x.items.len(),"attempt_count":x.attempts.len(),"observation_count":observation_ids.len(),"new_weaknesses_created":created,"review_updates":review_updates});
+        let response = RecordPracticeSessionResponse {
+            session_id: sid,
+            status: RecordStatus::Created,
+            exercise_type_key: type_key,
+            exercise_type_label: type_label.to_owned(),
+            item_count: x.items.len(),
+            attempt_count: x.attempts.len(),
+            observation_count: observation_ids.len(),
+            activity_run_count: x.activity_runs.len(),
+            stimulus_count: x.activity_runs.iter().map(|run| run.stimuli.len()).sum(),
+            reflection_count: x
+                .attempts
+                .iter()
+                .map(|attempt| attempt.reflections.len())
+                .sum(),
+            new_weaknesses_created: created,
+            review_updates,
+        };
         tx.execute("INSERT INTO recorded_requests(idempotency_key,session_id,request_hash,response_json,replayable) VALUES(?1,?2,?3,?4,1)",params![x.idempotency_key,sid,request_hash,serde_json::to_string(&response)?])?;
         tx.commit()?;
         Ok(response)
@@ -933,10 +1953,82 @@ impl LearningStore for SqliteStore {
         let c = self.conn()?;
         let cfg = scheduler_config(&c)?;
         let mix = request.drill_mix.unwrap_or(DrillMix::Auto);
-        let count = if matches!(mix, DrillMix::Fluency) {
+        let activity = request.activity_type;
+        if activity.is_some()
+            && matches!(
+                mix,
+                DrillMix::TranslationOnly | DrillMix::RecognitionToProduction | DrillMix::Fluency
+            )
+        {
+            bail!("drill_mix {:?} is incompatible with activity requests", mix)
+        }
+        if matches!(mix, DrillMix::Custom)
+            && request
+                .allowed_drill_types
+                .as_ref()
+                .is_none_or(|values| values.is_empty())
+        {
+            bail!("allowed_drill_types is required for custom drill_mix")
+        }
+        let count = if let Some(activity_type) = activity {
+            let spec = activities::activity_spec(activity_type);
+            if activities::is_single_response(activity_type) {
+                if request.count.is_some_and(|value| value != 1) {
+                    bail!("{} requires count=1", activity_type.as_str())
+                }
+                1
+            } else {
+                usize::from(request.count.unwrap_or(spec.default_count as u16))
+            }
+        } else if matches!(mix, DrillMix::Fluency) {
             1
         } else {
             usize::from(request.count.unwrap_or(6))
+        };
+        if !(1..=20).contains(&count) {
+            bail!("count must be between 1 and 20")
+        }
+        if request
+            .planned_duration_seconds
+            .is_some_and(|value| !(1..=7_200).contains(&value))
+        {
+            bail!("planned_duration_seconds must be between 1 and 7200")
+        }
+        if activity.is_none() && request.planned_duration_seconds.is_some() {
+            bail!("planned_duration_seconds requires activity_type")
+        }
+        let merged_activity_config = if let Some(activity_type) = activity {
+            let mut config =
+                activities::merged_config(activity_type, request.activity_config.as_ref())?;
+            if activity_type == ActivityType::QuestionAnswerSprint
+                && request
+                    .activity_config
+                    .as_ref()
+                    .and_then(|value| value.question_count)
+                    .is_none()
+            {
+                config.question_count =
+                    Some(u16::try_from(count).map_err(|_| anyhow!("count overflow"))?);
+            }
+            if activity_type == ActivityType::QuestionAnswerSprint
+                && config.question_count
+                    != Some(u16::try_from(count).map_err(|_| anyhow!("count overflow"))?)
+            {
+                bail!("question_count must equal the effective Q&A item count")
+            }
+            if activity_type == ActivityType::RolePlayComplications
+                && config
+                    .complication_count
+                    .is_some_and(|value| usize::from(value) >= count)
+            {
+                bail!("complication_count must be smaller than the effective item count")
+            }
+            Some(config)
+        } else {
+            if request.activity_config.is_some() {
+                bail!("activity_config requires activity_type")
+            }
+            None
         };
         let day = request
             .as_of
@@ -945,6 +2037,14 @@ impl LearningStore for SqliteStore {
             .transpose()?
             .unwrap_or(learning_day(now_utc(), &cfg.timezone, cfg.cutoff)?);
         let explicit = request.weakness_keys.as_deref();
+        if explicit.is_some_and(|keys| keys.len() > count) {
+            bail!("explicit weakness list contains more targets than count")
+        }
+        if matches!(mix, DrillMix::RecognitionToProduction)
+            && explicit.is_some_and(|keys| count < 2 * keys.len())
+        {
+            bail!("recognition_to_production requires at least two items per explicit target")
+        }
         let mut rows = load_weaknesses(
             &c,
             request.categories.as_deref(),
@@ -997,29 +2097,39 @@ impl LearningStore for SqliteStore {
             ordered = merged;
         }
         diversify_rows(&mut ordered);
-        let target_count = if explicit_cap {
-            ordered.len().min(count)
+        let target_limit = if matches!(mix, DrillMix::RecognitionToProduction) && !explicit_cap {
+            count / 2
+        } else if explicit_cap {
+            ordered.len()
         } else {
-            ordered.len().min(count.div_ceil(2).max(1))
+            count.div_ceil(2).max(1)
         };
+        let target_count = ordered.len().min(target_limit);
+        if target_count == 0 {
+            bail!("no active weakness matches the requested practice filters")
+        }
         ordered.truncate(target_count);
-        let allocations = if target_count == 0 {
-            vec![]
-        } else {
-            allocate(count, target_count)
-        };
+        let allocations = allocate(count, target_count);
+        let allowed = request.allowed_drill_types.as_deref();
+        let eligible = ordered
+            .iter()
+            .map(|row| {
+                eligible_recommendations(activity, mix, allowed, recommendations(&c, row.id)?)
+                    .map_err(|error| anyhow!("weakness {}: {error}", row.key))
+            })
+            .collect::<Result<Vec<_>>>()?;
         let prompt_limit = i32::from(request.recent_prompts_per_weakness.unwrap_or(4).min(10));
         let mut targets = Vec::new();
-        for (r, allocation) in ordered.iter().zip(allocations) {
-            let ret = row_retrievability(r, day, &cfg)?;
-            let reason = if r.pending {
+        for ((row, allocation), recs) in ordered.iter().zip(&allocations).zip(&eligible) {
+            let ret = row_retrievability(row, day, &cfg)?;
+            let reason = if row.pending {
                 "classification pending".to_owned()
-            } else if r.due.is_none() {
+            } else if row.due.is_none() {
                 format!(
                     "uninitialized; errors on {} distinct historical days",
-                    r.error_days
+                    row.error_days
                 )
-            } else if is_due(r, day) {
+            } else if is_due(row, day) {
                 format!(
                     "due FSRS review; predicted retrievability {}",
                     ret.map(|x| format!("{x:.2}"))
@@ -1028,15 +2138,123 @@ impl LearningStore for SqliteStore {
             } else {
                 "upcoming review".to_owned()
             };
-            targets.push(json!({"weakness_key":r.key,"category":r.category,"description":r.description,"target_pattern":r.target_pattern,"classification":classification(&c,r.id,matches!(request.drill_mix,Some(DrillMix::Custom)))?,"allocation":allocation,"selection_reason":reason,"fsrs":fsrs_json(r,day,&cfg)?,"drill_recommendations":recommendations(&c,r.id)?,"recommended_drill_types":recommendations(&c,r.id)?.iter().filter_map(|v|v["drill_type"].as_str()).collect::<Vec<_>>(),"recent_prompts_to_avoid":fetch_recent_prompts(&c,r.id,prompt_limit)?,"recent_error_examples":recent_errors(&c,r.id)?}));
+            targets.push(json!({
+                "weakness_key": row.key,
+                "category": row.category,
+                "description": row.description,
+                "target_pattern": row.target_pattern,
+                "classification": classification(&c, row.id, matches!(request.drill_mix, Some(DrillMix::Custom)))?,
+                "allocation": allocation,
+                "selection_reason": reason,
+                "fsrs": fsrs_json(row, day, &cfg)?,
+                "drill_recommendations": recs.iter().map(DrillRecommendation::json).collect::<Vec<_>>(),
+                "recommended_drill_types": recs.iter().map(|value| value.drill_type.as_str()).collect::<Vec<_>>(),
+                "recent_prompts_to_avoid": fetch_recent_prompts(&c, row.id, prompt_limit)?,
+                "recent_error_examples": recent_errors(&c, row.id)?,
+            }));
         }
-        let total = targets
-            .iter()
-            .map(|v| v["allocation"].as_u64().unwrap_or(0))
-            .sum::<u64>();
-        Ok(
-            json!({"as_of":day.to_string(),"objective":request.objective.unwrap_or(PracticeObjective::ReviewDue),"count":total,"level":request.level.unwrap_or_else(||"A2".to_owned()),"drill_mix":mix,"targets":targets,"generation_rules":[format!("Generate exactly {total} exercises using the allocations above"),"Use at least two materially varied cues when a target receives an FSRS rating","Do not reveal weakness keys or answers before the learner responds","Assess and record each item separately"]}),
-        )
+        let total = allocations.iter().sum::<usize>();
+        let mut response = json!({
+            "as_of": day.to_string(),
+            "objective": request.objective.unwrap_or(PracticeObjective::ReviewDue),
+            "count": total,
+            "level": request.level.unwrap_or_else(|| "A2".to_owned()),
+            "drill_mix": mix,
+            "targets": targets,
+            "generation_rules": [
+                format!("Generate exactly {total} exercises using the allocations above"),
+                "Use at least two materially varied cues when a target receives an FSRS rating",
+                "Do not reveal weakness keys or answers before the learner responds",
+                "Assess and record each item separately",
+            ],
+        });
+        if let Some(activity_type) = activity {
+            let config_value = serde_json::to_value(merged_activity_config.as_ref().unwrap())?;
+            let complication_count = merged_activity_config
+                .as_ref()
+                .and_then(|value| value.complication_count)
+                .map(usize::from)
+                .unwrap_or(0);
+            let mut occurrences = vec![0usize; target_count];
+            let mut cursor = 0usize;
+            let mut allocations_json = Vec::with_capacity(total);
+            for item_no in 1..=total {
+                let target_index = (0..target_count)
+                    .map(|offset| (cursor + offset) % target_count)
+                    .find(|index| occurrences[*index] < allocations[*index])
+                    .expect("round-robin allocation must cover every item");
+                let occurrence = occurrences[target_index];
+                occurrences[target_index] += 1;
+                cursor = (target_index + 1) % target_count;
+                let recommendation = if matches!(mix, DrillMix::RecognitionToProduction) {
+                    if occurrence == 0 {
+                        eligible[target_index]
+                            .iter()
+                            .find(|value| value.stage == "recognition")
+                            .expect("validated recognition recommendation")
+                    } else {
+                        eligible[target_index]
+                            .iter()
+                            .find(|value| {
+                                matches!(
+                                    value.stage.as_str(),
+                                    "controlled" | "transfer" | "fluency"
+                                )
+                            })
+                            .expect("validated production recommendation")
+                    }
+                } else {
+                    &eligible[target_index][0]
+                };
+                let phase = activities::phase_for_item(
+                    activity_type,
+                    item_no - 1,
+                    total,
+                    complication_count,
+                );
+                allocations_json.push(json!({
+                    "item_no": item_no,
+                    "drill_type": recommendation.drill_type,
+                    "target_weakness_keys": [ordered[target_index].key],
+                    "phase": phase,
+                    "target_duration_seconds": merged_activity_config
+                        .as_ref()
+                        .and_then(|value| value.response_seconds),
+                    "intended_evidence_strength": activities::activity_spec(activity_type).intended_evidence_strength,
+                }));
+            }
+            let spec = activities::activity_spec(activity_type);
+            let mut plan = json!({
+                "activity_type": activity_type,
+                "interaction_mode": spec.interaction_mode,
+                "run_count": 1,
+                "item_count": total,
+                "config": config_value,
+                "stimulus_requirements": activities::stimulus_requirements(activity_type),
+                "item_allocations": allocations_json,
+                "recording_rules": [
+                    "Store each learner-facing prompt or turn separately",
+                    "Spoken responses are stored as transcripts only; do not infer audio properties or timing from transcript text",
+                    "Record timing only when explicitly learner-reported or externally measured",
+                    "For a voice diary, ask the learner afterward for two or three self-reported process reflections",
+                ],
+            });
+            if let Some(planned) = request
+                .planned_duration_seconds
+                .or(spec.default_planned_duration_seconds)
+            {
+                plan["planned_duration_seconds"] = json!(planned);
+            }
+            response["activity_plan"] = plan;
+            response["generation_rules"] = json!([
+                "ChatGPT generates and presents the exercise language or obtains the declared text stimulus",
+                "The activity plan describes constraints; it does not verify that a source was hidden, heard, or timed",
+                format!(
+                    "Generate exactly {total} learner-facing turns according to the activity plan"
+                ),
+            ]);
+        }
+        Ok(response)
     }
 
     async fn upsert_weakness_json(&self, payload: Value) -> Result<Value> {
@@ -1059,6 +2277,7 @@ impl LearningStore for SqliteStore {
             },
             false,
             false,
+            true,
         )?;
         let row = classification(&tx, id, true)?;
         tx.commit()?;
@@ -1083,11 +2302,19 @@ impl LearningStore for SqliteStore {
     async fn data_status(&self) -> Result<Value> {
         let c = self.conn()?;
         let cfg = scheduler_config(&c)?;
+        let schema_raw: String = c.query_row(
+            "SELECT value FROM schema_meta WHERE key='schema_version'",
+            [],
+            |r| r.get(0),
+        )?;
+        let schema_version = schema_raw
+            .parse::<i64>()
+            .map_err(|_| anyhow!("schema_meta contains an invalid schema_version"))?;
         let count = |table: &str| -> Result<i64> {
             Ok(c.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))?)
         };
         Ok(
-            json!({"schema_version":7,"storage_model":"single_learner","spaced_repetition":true,"scheduler":{"algorithm":cfg.algorithm,"algorithm_version":cfg.algorithm_version,"desired_retention":cfg.desired_retention,"parameter_set_id":cfg.parameter_set_id,"parameters_source":cfg.source},"last_session_date":c.query_row("SELECT max(session_date) FROM sessions",[],|r|r.get::<_,Option<String>>(0))?,"counts":{"sessions":count("sessions")?,"practice_items":count("practice_items")?,"attempts":count("attempts")?,"observations":count("observations")?,"weaknesses":count("weaknesses")?,"active_weaknesses":c.query_row("SELECT count(*) FROM weaknesses WHERE target_status='active'",[],|r|r.get::<_,i64>(0))?,"scheduler_items":count("scheduler_items")?,"weakness_reviews":count("weakness_reviews")?,"review_observations":count("review_observations")?}}),
+            json!({"schema_version":schema_version,"storage_model":"single_learner","spaced_repetition":true,"scheduler":{"algorithm":cfg.algorithm,"algorithm_version":cfg.algorithm_version,"desired_retention":cfg.desired_retention,"parameter_set_id":cfg.parameter_set_id,"parameters_source":cfg.source},"last_session_date":c.query_row("SELECT max(session_date) FROM sessions",[],|r|r.get::<_,Option<String>>(0))?,"counts":{"sessions":count("sessions")?,"practice_items":count("practice_items")?,"attempts":count("attempts")?,"observations":count("observations")?,"weaknesses":count("weaknesses")?,"active_weaknesses":c.query_row("SELECT count(*) FROM weaknesses WHERE target_status='active'",[],|r|r.get::<_,i64>(0))?,"scheduler_items":count("scheduler_items")?,"weakness_reviews":count("weakness_reviews")?,"review_observations":count("review_observations")?,"activity_runs":count("activity_runs")?,"activity_stimuli":count("activity_stimuli")?,"attempt_reflections":count("attempt_reflections")?}}),
         )
     }
     async fn ping(&self) -> Result<()> {
@@ -1096,24 +2323,10 @@ impl LearningStore for SqliteStore {
     }
 }
 
-fn resolve_exercise_type(c: &Connection, key: Option<&str>) -> Result<(String, String)> {
-    let key = key.ok_or_else(|| anyhow!("exercise_type_key is required for new sessions"))?;
-    let canonical = match key {
-        "4-3-2" => "fluency_4_3_2",
-        "production drill" => "production_drill",
-        "translation_drill" => "translation_drill",
-        "DELE A2 oral microdrill" => "dele_a2_oral_microdrill",
-        "agreement/disagreement drill" => "agreement_disagreement_drill",
-        "guided conversation drill" => "guided_conversation",
-        x => x,
-    };
-    c.query_row(
-        "SELECT key,label FROM exercise_types WHERE key=?1 AND active=1",
-        [canonical],
-        |r| Ok((r.get(0)?, r.get(1)?)),
-    )
-    .optional()?
-    .ok_or_else(|| anyhow!("unknown exercise_type_key: {canonical}"))
+fn exercise_type_from_db(value: &str) -> Result<ExerciseTypeKey> {
+    ExerciseTypeKey::from_str(value).ok_or_else(|| {
+        anyhow!("sessions.exercise_type_key violates the canonical database invariant: {value}")
+    })
 }
 fn weakness_exists(c: &Connection, key: &str) -> Result<bool> {
     Ok(c.query_row(
@@ -1178,7 +2391,109 @@ fn all_weakness_keys(x: &RecordPracticeSessionRequest) -> Vec<String> {
             .flat_map(|a| a.observations.iter().map(|o| o.weakness_key.clone())),
     );
     v.extend(x.observations.iter().map(|o| o.weakness_key.clone()));
+    v.extend(x.reviews.iter().map(|review| review.weakness_key.clone()));
     v
+}
+
+fn validate_record_database_references(
+    c: &Connection,
+    request: &RecordPracticeSessionRequest,
+) -> std::result::Result<(), RecordPracticeError> {
+    let new_keys = request
+        .new_weaknesses
+        .iter()
+        .map(|weakness| weakness.key.as_str())
+        .collect::<HashSet<_>>();
+    let weakness_is_known = |key: &str| -> std::result::Result<bool, RecordPracticeError> {
+        if new_keys.contains(key) {
+            Ok(true)
+        } else {
+            weakness_exists(c, key).map_err(RecordPracticeError::from)
+        }
+    };
+    for key in all_weakness_keys(request) {
+        if !weakness_is_known(&key)? {
+            return Err(RecordPracticeError::unknown(format!(
+                "weakness_key \"{key}\" does not exist and is not declared in new_weaknesses"
+            )));
+        }
+    }
+
+    let run_numbers = request
+        .activity_runs
+        .iter()
+        .map(|run| run.run_no)
+        .collect::<HashSet<_>>();
+    for (index, item) in request.items.iter().enumerate() {
+        if let Some(run_no) = item.activity_run_no
+            && !run_numbers.contains(&run_no)
+        {
+            return Err(RecordPracticeError::unknown(format!(
+                "items[{index}].activity_run_no references an activity run not in this request"
+            )));
+        }
+    }
+
+    for (index, weakness) in request.new_weaknesses.iter().enumerate() {
+        if let Some(concept_key) = weakness.primary_concept_key.as_deref() {
+            taxonomy::validate_concept_key(concept_key).map_err(|error| {
+                RecordPracticeError::invalid(format!(
+                    "new_weaknesses[{index}].primary_concept_key: {error}"
+                ))
+            })?;
+            let exists: bool = c
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM concepts WHERE key=?1)",
+                    [concept_key],
+                    |row| row.get(0),
+                )
+                .map_err(RecordPracticeError::from)?;
+            if !exists {
+                return Err(RecordPracticeError::unknown(format!(
+                    "new_weaknesses[{index}].primary_concept_key \"{concept_key}\" does not exist"
+                )));
+            }
+        }
+        for (link_index, link) in weakness.concept_links.iter().enumerate() {
+            taxonomy::validate_concept_key(&link.concept_key).map_err(|error| {
+                RecordPracticeError::invalid(format!(
+                    "new_weaknesses[{index}].concept_links[{link_index}].concept_key: {error}"
+                ))
+            })?;
+            let exists: bool = c
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM concepts WHERE key=?1)",
+                    [&link.concept_key],
+                    |row| row.get(0),
+                )
+                .map_err(RecordPracticeError::from)?;
+            if !exists {
+                return Err(RecordPracticeError::unknown(format!(
+                    "new_weaknesses[{index}].concept_links[{link_index}].concept_key \"{}\" does not exist",
+                    link.concept_key
+                )));
+            }
+        }
+        for (relation_index, relation) in weakness.target_relations.iter().enumerate() {
+            taxonomy::validate_target_relation_predicate(&relation.predicate).map_err(|error| {
+                RecordPracticeError::invalid(format!(
+                    "new_weaknesses[{index}].target_relations[{relation_index}].predicate: {error}"
+                ))
+            })?;
+            if relation.other_weakness_key == weakness.key {
+                return Err(RecordPracticeError::invalid(format!(
+                    "new_weaknesses[{index}].target_relations[{relation_index}] cannot target itself"
+                )));
+            }
+            if !weakness_is_known(&relation.other_weakness_key)? {
+                return Err(RecordPracticeError::unknown(format!(
+                    "new_weaknesses[{index}].target_relations[{relation_index}].other_weakness_key \"{}\" does not exist and is not declared in new_weaknesses",
+                    relation.other_weakness_key
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 fn insert_observation(
     c: &Connection,
@@ -1190,9 +2505,7 @@ fn insert_observation(
 ) -> Result<()> {
     let phase = evidence::normalized_phase(o)?;
     let hint = o.hint_level.unwrap_or(HintLevel::None);
-    let no = o
-        .observation_no
-        .ok_or_else(|| anyhow!("observation_no is required"))?;
+    let no = o.observation_no;
     let outcome = serialize_enum(&o.outcome)?;
     let evidence_strength = o
         .evidence_strength
@@ -1212,6 +2525,7 @@ fn upsert_weakness_tx(
     w: &NewWeaknessInput,
     declared_item: bool,
     default_candidate: bool,
+    insert_relations: bool,
 ) -> Result<(i64, bool)> {
     let existing: Option<(i64, String, String, i64)> = c
         .query_row(
@@ -1275,8 +2589,10 @@ fn upsert_weakness_tx(
             c.execute("INSERT INTO weakness_concepts(weakness_id,concept_id,role) SELECT ?1,id,?2 FROM concepts WHERE key=?3",params![id,link.role.as_str(),key])?;
         }
     }
-    for relation in &w.target_relations {
-        insert_target_relation(c, &w.key, relation)?;
+    if insert_relations {
+        for relation in &w.target_relations {
+            insert_target_relation(c, &w.key, relation)?;
+        }
     }
     if status == "active" {
         c.execute("INSERT OR IGNORE INTO scheduler_items(weakness_id,track,active) VALUES(?1,'general',1)",[id])?;
@@ -1656,8 +2972,32 @@ impl LearningStore for MockStore {
     async fn recent_practice(&self, r: RecentPracticeRequest) -> Result<Value> {
         Ok(json!({"items":[],"limit":r.limit.unwrap_or(10),"skill":r.skill}))
     }
-    async fn record_practice_json(&self, p: Value) -> Result<Value> {
-        Ok(json!({"recorded":true,"payload":p}))
+    async fn record_practice(
+        &self,
+        request: RecordPracticeSessionRequest,
+    ) -> std::result::Result<RecordPracticeSessionResponse, RecordPracticeError> {
+        Ok(RecordPracticeSessionResponse {
+            session_id: 0,
+            status: RecordStatus::Created,
+            exercise_type_key: request.exercise_type_key,
+            exercise_type_label: request.exercise_type_key.label().to_owned(),
+            item_count: request.items.len(),
+            attempt_count: request.attempts.len(),
+            observation_count: request.observations.len(),
+            activity_run_count: request.activity_runs.len(),
+            stimulus_count: request
+                .activity_runs
+                .iter()
+                .map(|run| run.stimuli.len())
+                .sum(),
+            reflection_count: request
+                .attempts
+                .iter()
+                .map(|attempt| attempt.reflections.len())
+                .sum(),
+            new_weaknesses_created: vec![],
+            review_updates: vec![],
+        })
     }
     async fn review_queue(&self, r: ReviewQueueRequest) -> Result<Value> {
         Ok(
@@ -1677,7 +3017,9 @@ impl LearningStore for MockStore {
         Ok(json!({"updated":true,"patch":p}))
     }
     async fn data_status(&self) -> Result<Value> {
-        Ok(json!({"schema_version":7,"status":"ready"}))
+        Ok(
+            json!({"schema_version":9,"status":"ready","counts":{"activity_runs":0,"activity_stimuli":0,"attempt_reflections":0}}),
+        )
     }
     async fn ping(&self) -> Result<()> {
         Ok(())
@@ -1710,6 +3052,36 @@ mod tests {
             .unwrap(),
             1
         );
+        let seeded = c
+            .prepare("SELECT key,label,interaction_mode,active FROM activity_types ORDER BY key")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        let expected = crate::activities::activity_catalog()
+            .into_iter()
+            .map(|spec| {
+                (
+                    spec.activity_type.as_str().to_owned(),
+                    spec.label.to_owned(),
+                    spec.interaction_mode.as_str().to_owned(),
+                    1,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(seeded, {
+            let mut expected = expected;
+            expected.sort();
+            expected
+        });
     }
     #[test]
     fn timezone_uses_iana_dst() {
@@ -1734,7 +3106,7 @@ mod tests {
         let store = test_store();
         let payload = json!({
             "idempotency_key": "test-deliberate-1",
-            "exercise_type": "translation_drill",
+            "exercise_type_key": "translation_drill",
             "new_weaknesses": [{
                 "key": "future.lexical.target",
                 "category": "lexis",
@@ -1774,9 +3146,11 @@ mod tests {
             Some(AssessmentPhase::ColdRetrieval)
         );
         evidence::validate_session_observation_numbers(&parsed).unwrap();
-        let first = store.record_practice_json(payload.clone()).await.unwrap();
-        assert_eq!(first["recorded"], true);
-        assert_eq!(first["review_updates"].as_array().unwrap().len(), 1);
+        let parsed_for_record: RecordPracticeSessionRequest =
+            serde_json::from_value(payload.clone()).unwrap();
+        let first = store.record_practice(parsed_for_record).await.unwrap();
+        assert_eq!(first.status, RecordStatus::Created);
+        assert_eq!(first.review_updates.len(), 1);
         let scheduler_id: i64 = {
             let c = store.conn().unwrap();
             c.query_row(
@@ -1800,8 +3174,9 @@ mod tests {
             updated["classification"]["primary_concept"]["key"],
             "form.lexis.lexeme_choice"
         );
-        let replay = store.record_practice_json(payload).await.unwrap();
-        assert_eq!(replay["idempotent_replay"], true);
+        let replay_request: RecordPracticeSessionRequest = serde_json::from_value(payload).unwrap();
+        let replay = store.record_practice(replay_request).await.unwrap();
+        assert_eq!(replay.status, RecordStatus::Replayed);
         let c = store.conn().unwrap();
         assert_eq!(
             c.query_row(
@@ -1849,5 +3224,174 @@ mod tests {
             .unwrap(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn activity_recording_and_full_recent_output_round_trip() {
+        let store = test_store();
+        let payload = json!({
+            "idempotency_key": "activity-round-trip",
+            "exercise_type_key": "production_drill",
+            "new_weaknesses": [{
+                "key": "activity.target",
+                "category": "production",
+                "description": "A target used by an activity",
+                "target_type": "lexical_item"
+            }],
+            "activity_runs": [{
+                "run_no": 1,
+                "activity_type": "situational_response",
+                "config": {"preparation_seconds": 3},
+                "stimuli": [{
+                    "stimulus_no": 1,
+                    "kind": "situation",
+                    "delivery_mode": "read",
+                    "content_text": "Estás en una farmacia."
+                }]
+            }],
+            "items": [{
+                "item_no": 1,
+                "activity_run_no": 1,
+                "drill_type": "situational_response",
+                "prompt": "Explica el problema.",
+                "target_weakness_keys": ["activity.target"]
+            }],
+            "attempts": [{
+                "attempt_no": 1,
+                "practice_item_no": 1,
+                "transcript": "Tengo un problema.",
+                "response_mode": "spoken_transcript",
+                "reflections": [{
+                    "reflection_no": 1,
+                    "source": "learner",
+                    "kind": "retrieval_gap_reported",
+                    "note": "No encontré la palabra exacta."
+                }]
+            }]
+        });
+        let request: RecordPracticeSessionRequest = serde_json::from_value(payload).unwrap();
+        let response = store.record_practice(request).await.unwrap();
+        assert_eq!(response.activity_run_count, 1);
+        assert_eq!(response.stimulus_count, 1);
+        assert_eq!(response.reflection_count, 1);
+
+        let brief: PracticeBriefRequest = serde_json::from_value(json!({
+            "activity_type": "situational_response",
+            "count": 4,
+            "weakness_keys": ["activity.target"]
+        }))
+        .unwrap();
+        let brief = store.practice_brief(brief).await.unwrap();
+        assert_eq!(
+            brief["activity_plan"]["activity_type"],
+            "situational_response"
+        );
+        assert_eq!(
+            brief["activity_plan"]["item_allocations"]
+                .as_array()
+                .unwrap()
+                .len(),
+            4
+        );
+
+        let recent: RecentPracticeRequest = serde_json::from_value(json!({
+            "limit": 1,
+            "detail": "full",
+            "activity_types": ["situational_response"],
+            "response_modes": ["spoken_transcript"]
+        }))
+        .unwrap();
+        let recent = store.recent_practice(recent).await.unwrap();
+        let session = &recent["items"][0];
+        assert_eq!(
+            session["activity_runs"][0]["stimuli"][0]["content_text"],
+            "Estás en una farmacia."
+        );
+        assert_eq!(session["items"][0]["activity_run_no"], 1);
+        assert_eq!(session["items"][0]["item_phase"], "initial");
+        assert_eq!(session["attempts"][0]["response_mode"], "spoken_transcript");
+        assert_eq!(
+            session["attempts"][0]["reflections"][0]["kind"],
+            "retrieval_gap_reported"
+        );
+    }
+
+    #[tokio::test]
+    async fn all_activity_briefs_are_explicit_and_compatible() {
+        let store = test_store();
+        store
+            .upsert_weakness_json(json!({
+                "key": "activity.catalog.target",
+                "category": "production",
+                "description": "A target for catalog brief coverage",
+                "target_type": "lexical_item"
+            }))
+            .await
+            .unwrap();
+
+        for spec in crate::activities::activity_catalog() {
+            let brief = store
+                .practice_brief(PracticeBriefRequest {
+                    count: None,
+                    objective: None,
+                    level: None,
+                    drill_mix: None,
+                    allowed_drill_types: None,
+                    weakness_keys: Some(vec!["activity.catalog.target".to_owned()]),
+                    categories: None,
+                    concept_keys: None,
+                    scheme_keys: None,
+                    collection_keys: None,
+                    target_types: None,
+                    include_upcoming: None,
+                    recent_prompts_per_weakness: None,
+                    as_of: Some("2026-08-31".to_owned()),
+                    activity_type: Some(spec.activity_type),
+                    planned_duration_seconds: None,
+                    activity_config: None,
+                })
+                .await
+                .unwrap();
+            let plan = &brief["activity_plan"];
+            assert_eq!(plan["activity_type"], spec.activity_type.as_str());
+            assert_eq!(plan["interaction_mode"], spec.interaction_mode.as_str());
+            assert_eq!(plan["item_count"], spec.default_count);
+            assert_eq!(
+                plan["stimulus_requirements"],
+                json!(crate::activities::stimulus_requirements(spec.activity_type))
+            );
+            let allocations = plan["item_allocations"].as_array().unwrap();
+            assert_eq!(allocations.len(), spec.default_count);
+            for (index, allocation) in allocations.iter().enumerate() {
+                let expected_phase = crate::activities::phase_for_item(
+                    spec.activity_type,
+                    index,
+                    spec.default_count,
+                    spec.default_config
+                        .complication_count
+                        .map(usize::from)
+                        .unwrap_or(0),
+                );
+                assert_eq!(allocation["phase"], expected_phase.as_str());
+                assert!(
+                    spec.compatible_drills
+                        .iter()
+                        .any(|drill| { allocation["drill_type"] == drill.as_str() })
+                );
+                assert_eq!(
+                    allocation["intended_evidence_strength"],
+                    spec.intended_evidence_strength
+                );
+            }
+            assert!(
+                plan["recording_rules"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|rule| rule
+                        .as_str()
+                        .is_some_and(|text| text.contains("transcripts only")))
+            );
+        }
     }
 }

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use aprendiendo_mcp::{db::MockStore, server::LearningServer};
+use aprendiendo_mcp::{db::SqliteStore, server::LearningServer};
 use axum::Router;
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
@@ -26,7 +26,11 @@ async fn post_rpc(client: &reqwest::Client, url: &str, payload: Value) -> Value 
 #[tokio::test]
 async fn streamable_http_lists_and_calls_domain_tools() {
     let cancellation = CancellationToken::new();
-    let template = LearningServer::new(Arc::new(MockStore), None);
+    let database_path = std::env::temp_dir().join(format!(
+        "aprendiendo-protocol-{}.sqlite3",
+        uuid::Uuid::new_v4()
+    ));
+    let template = LearningServer::new(Arc::new(SqliteStore::new(&database_path).unwrap()), None);
     let service: StreamableHttpService<LearningServer, LocalSessionManager> =
         StreamableHttpService::new(
             move || Ok(template.clone()),
@@ -80,6 +84,49 @@ async fn streamable_http_lists_and_calls_domain_tools() {
     assert!(!serialized.contains("projectId"));
     assert!(!serialized.contains("databaseName"));
     assert!(!serialized.contains("run_sql"));
+    let record_tool = tools
+        .iter()
+        .find(|tool| tool["name"] == "record_practice_session")
+        .expect("record tool should be listed");
+    let input_schema = &record_tool["inputSchema"];
+    let required = input_schema["required"]
+        .as_array()
+        .expect("record input schema should have required fields");
+    assert!(required.iter().any(|field| field == "exercise_type_key"));
+    assert!(!required.iter().any(|field| field == "exercise_type"));
+    assert!(input_schema["properties"].get("exercise_type").is_none());
+    assert_eq!(input_schema["properties"]["items"]["maxItems"], 100);
+    assert_eq!(
+        input_schema["$defs"]["ObservationInput"]["properties"]["observation_no"]["minimum"],
+        1
+    );
+    assert_eq!(
+        input_schema["$defs"]["ActivityRunInput"]["properties"]["planned_duration_seconds"]["maximum"],
+        7200
+    );
+    assert_eq!(
+        input_schema["$defs"]["AttemptInput"]["properties"]["response_latency_milliseconds"]["maximum"],
+        3_600_000
+    );
+    assert!(
+        record_tool["description"]
+            .as_str()
+            .unwrap()
+            .contains("idempotency")
+    );
+    assert_eq!(record_tool["annotations"]["idempotentHint"], true);
+    let output_schema = &record_tool["outputSchema"];
+    let output_data = &output_schema["$defs"]["RecordPracticeSessionResponse"];
+    let output_required = output_data["required"]
+        .as_array()
+        .expect("typed record output should declare required fields");
+    assert!(output_required.iter().any(|field| field == "status"));
+    assert!(output_data["properties"].get("recorded").is_none());
+    assert!(output_data["properties"].get("idempotent_replay").is_none());
+    assert_eq!(
+        output_schema["$defs"]["RecordStatus"]["enum"],
+        json!(["created", "replayed"])
+    );
 
     let called = post_rpc(
         &client,
@@ -92,12 +139,112 @@ async fn streamable_http_lists_and_calls_domain_tools() {
         }),
     )
     .await;
+    assert!(called["result"]["structuredContent"]["data"]["recent_sessions"].is_array());
+
+    let record_arguments = json!({
+        "idempotency_key": "protocol-record-001",
+        "exercise_type_key": "translation_drill"
+    });
+    let first = post_rpc(
+        &client,
+        &url,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {"name": "record_practice_session", "arguments": record_arguments.clone()}
+        }),
+    )
+    .await;
     assert_eq!(
-        called["result"]["structuredContent"]["data"]["recent_sessions"],
-        3
+        first["result"]["structuredContent"]["data"]["status"],
+        "created"
+    );
+    let replay = post_rpc(
+        &client,
+        &url,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "tools/call",
+            "params": {"name": "record_practice_session", "arguments": record_arguments}
+        }),
+    )
+    .await;
+    assert_eq!(
+        replay["result"]["structuredContent"]["data"]["status"],
+        "replayed"
+    );
+    let changed = post_rpc(
+        &client,
+        &url,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "tools/call",
+            "params": {"name": "record_practice_session", "arguments": {
+                "idempotency_key": "protocol-record-001",
+                "exercise_type_key": "translation_drill",
+                "topic": "changed"
+            }}
+        }),
+    )
+    .await;
+    assert_eq!(changed["result"]["isError"], true);
+    assert!(
+        changed["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("idempotency_conflict")
+    );
+    let legacy = post_rpc(
+        &client,
+        &url,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/call",
+            "params": {"name": "record_practice_session", "arguments": {
+                "idempotency_key": "protocol-legacy-001",
+                "exercise_type": "translation_drill"
+            }}
+        }),
+    )
+    .await;
+    assert_eq!(legacy["result"]["isError"], true);
+    let unknown_key = post_rpc(
+        &client,
+        &url,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 8,
+            "method": "tools/call",
+            "params": {"name": "record_practice_session", "arguments": {
+                "idempotency_key": "protocol-unknown-key-001",
+                "exercise_type_key": "not_a_canonical_key"
+            }}
+        }),
+    )
+    .await;
+    assert_eq!(unknown_key["result"]["isError"], true);
+    let status = post_rpc(
+        &client,
+        &url,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 9,
+            "method": "tools/call",
+            "params": {"name": "get_data_status", "arguments": {}}
+        }),
+    )
+    .await;
+    assert_eq!(
+        status["result"]["structuredContent"]["data"]["counts"]["sessions"],
+        1
     );
 
     task.abort();
+    let _ = std::fs::remove_file(database_path);
 }
 
 use aprendiendo_mcp::config::EmbeddedOauthConfig;

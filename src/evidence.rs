@@ -60,9 +60,7 @@ pub fn validate_session_observation_numbers(request: &RecordPracticeSessionReque
 }
 
 fn validate_one(observation: &ObservationInput, numbers: &mut HashSet<u16>) -> Result<()> {
-    let number = observation
-        .observation_no
-        .ok_or_else(|| anyhow::anyhow!("every new observation requires observation_no"))?;
+    let number = observation.observation_no;
     if number == 0 || !numbers.insert(number) {
         bail!("observation_no values must be unique integers of at least 1 across the session");
     }
@@ -77,7 +75,7 @@ mod tests {
 
     fn base() -> ObservationInput {
         ObservationInput {
-            observation_no: Some(1),
+            observation_no: 1,
             weakness_key: "x".into(),
             outcome: ObservationOutcome::Incorrect,
             role: ObservationRole::Targeted,

@@ -3,8 +3,11 @@ PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS sessions (
   id INTEGER PRIMARY KEY,
   session_date TEXT NOT NULL DEFAULT (date('now')),
-  exercise_type TEXT NOT NULL,
-  exercise_type_key TEXT REFERENCES exercise_types(key),
+  exercise_type_key TEXT NOT NULL CHECK (exercise_type_key IN (
+    'fluency_4_3_2', 'production_drill', 'translation_drill',
+    'dele_a2_oral_microdrill', 'agreement_disagreement_drill',
+    'guided_conversation'
+  )),
   topic TEXT,
   notes TEXT,
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
@@ -141,9 +144,37 @@ CREATE TABLE IF NOT EXISTS weakness_drill_overrides (
   weight REAL NOT NULL CHECK (weight >= 0 AND weight <= 1), PRIMARY KEY (weakness_id, drill_type, stage)
 );
 
-CREATE TABLE IF NOT EXISTS exercise_types (
-  key TEXT PRIMARY KEY, label TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0,1))
+CREATE TABLE IF NOT EXISTS activity_types (
+  key TEXT PRIMARY KEY,
+  label TEXT NOT NULL,
+  interaction_mode TEXT NOT NULL CHECK (interaction_mode IN (
+    'single_response', 'sprint', 'multi_turn'
+  )),
+  active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0,1))
 );
+
+CREATE TABLE IF NOT EXISTS activity_runs (
+  id INTEGER PRIMARY KEY,
+  session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  run_no INTEGER NOT NULL CHECK (run_no >= 1),
+  activity_type_key TEXT NOT NULL REFERENCES activity_types(key),
+  planned_duration_seconds INTEGER
+    CHECK (planned_duration_seconds IS NULL OR planned_duration_seconds > 0),
+  actual_duration_milliseconds INTEGER
+    CHECK (actual_duration_milliseconds IS NULL OR actual_duration_milliseconds > 0),
+  timing_source TEXT CHECK (timing_source IS NULL OR timing_source IN (
+    'learner_reported', 'external_timer', 'client_measured'
+  )),
+  config_json TEXT NOT NULL DEFAULT '{}'
+    CHECK (json_valid(config_json) AND json_type(config_json)='object'),
+  notes TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  UNIQUE(session_id, run_no),
+  UNIQUE(id, session_id),
+  CHECK (actual_duration_milliseconds IS NULL OR timing_source IS NOT NULL)
+);
+CREATE INDEX IF NOT EXISTS activity_runs_type_session_idx
+  ON activity_runs(activity_type_key, session_id);
 
 CREATE TABLE IF NOT EXISTS practice_items (
   id INTEGER PRIMARY KEY,
@@ -153,8 +184,12 @@ CREATE TABLE IF NOT EXISTS practice_items (
   prompt TEXT NOT NULL, prompt_fingerprint TEXT,
   response TEXT, corrected_response TEXT, reference_answer TEXT, feedback TEXT,
   outcome TEXT CHECK (outcome IS NULL OR outcome IN ('incorrect','partially_correct','correct','omitted')),
+  activity_run_id INTEGER,
+  item_phase TEXT NOT NULL DEFAULT 'initial' CHECK (item_phase IN ('initial','follow_up','complication')),
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-  UNIQUE(id, session_id), UNIQUE(session_id, item_no)
+  UNIQUE(id, session_id), UNIQUE(session_id, item_no),
+  FOREIGN KEY (activity_run_id, session_id)
+    REFERENCES activity_runs(id, session_id) ON DELETE CASCADE
 );
 CREATE TABLE IF NOT EXISTS practice_item_targets (
   practice_item_id INTEGER NOT NULL REFERENCES practice_items(id) ON DELETE CASCADE,
@@ -166,10 +201,56 @@ CREATE TABLE IF NOT EXISTS attempts (
   attempt_no INTEGER NOT NULL CHECK (attempt_no >= 1), practice_item_id INTEGER,
   transcript TEXT NOT NULL, target_duration_seconds INTEGER CHECK (target_duration_seconds IS NULL OR target_duration_seconds > 0),
   actual_duration_milliseconds INTEGER CHECK (actual_duration_milliseconds IS NULL OR actual_duration_milliseconds > 0),
+  response_mode TEXT CHECK (response_mode IS NULL OR response_mode IN ('typed','spoken_transcript')),
+  response_latency_milliseconds INTEGER CHECK (response_latency_milliseconds IS NULL OR response_latency_milliseconds > 0),
+  timing_source TEXT CHECK (timing_source IS NULL OR timing_source IN ('learner_reported','external_timer','client_measured')),
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   UNIQUE(id, session_id), UNIQUE(session_id, attempt_no),
+  CHECK (response_latency_milliseconds IS NULL OR timing_source IS NOT NULL),
   FOREIGN KEY (practice_item_id, session_id) REFERENCES practice_items(id, session_id) ON DELETE CASCADE
 );
+
+CREATE TABLE IF NOT EXISTS activity_stimuli (
+  id INTEGER PRIMARY KEY,
+  activity_run_id INTEGER NOT NULL REFERENCES activity_runs(id) ON DELETE CASCADE,
+  stimulus_no INTEGER NOT NULL CHECK (stimulus_no >= 1),
+  kind TEXT NOT NULL CHECK (kind IN (
+    'situation', 'source_text', 'image_description',
+    'image_sequence_description', 'article_reference',
+    'media_transcript', 'complication'
+  )),
+  delivery_mode TEXT NOT NULL CHECK (delivery_mode IN (
+    'read', 'viewed', 'heard_reported', 'conversation'
+  )),
+  content_text TEXT,
+  source_uri TEXT,
+  content_fingerprint TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  UNIQUE(activity_run_id, stimulus_no),
+  CHECK (
+    (content_text IS NOT NULL AND length(trim(content_text)) > 0)
+    OR (source_uri IS NOT NULL AND length(trim(source_uri)) > 0)
+  )
+);
+CREATE INDEX IF NOT EXISTS activity_stimuli_run_idx
+  ON activity_stimuli(activity_run_id, stimulus_no);
+
+CREATE TABLE IF NOT EXISTS attempt_reflections (
+  id INTEGER PRIMARY KEY,
+  attempt_id INTEGER NOT NULL REFERENCES attempts(id) ON DELETE CASCADE,
+  reflection_no INTEGER NOT NULL CHECK (reflection_no >= 1),
+  source TEXT NOT NULL CHECK (source IN ('learner', 'assistant')),
+  kind TEXT NOT NULL CHECK (kind IN (
+    'hesitation_reported', 'simplification_reported',
+    'retrieval_gap_reported', 'self_correction_reported',
+    'circumlocution_reported', 'general'
+  )),
+  note TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  UNIQUE(attempt_id, reflection_no)
+);
+CREATE INDEX IF NOT EXISTS attempt_reflections_attempt_idx
+  ON attempt_reflections(attempt_id, reflection_no);
 
 CREATE TABLE IF NOT EXISTS observations (
   id INTEGER PRIMARY KEY, session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -256,5 +337,7 @@ CREATE INDEX IF NOT EXISTS observations_session_id_idx ON observations(session_i
 CREATE INDEX IF NOT EXISTS observations_attempt_id_idx ON observations(attempt_id);
 CREATE INDEX IF NOT EXISTS observations_weakness_id_idx ON observations(weakness_id);
 CREATE INDEX IF NOT EXISTS practice_items_session_id_idx ON practice_items(session_id);
+CREATE INDEX IF NOT EXISTS practice_items_activity_run_idx ON practice_items(activity_run_id, item_no);
 CREATE INDEX IF NOT EXISTS practice_item_targets_weakness_idx ON practice_item_targets(weakness_id, practice_item_id);
 CREATE INDEX IF NOT EXISTS prompt_fingerprint_created_idx ON practice_items(prompt_fingerprint, created_at);
+CREATE INDEX IF NOT EXISTS attempts_response_mode_session_idx ON attempts(response_mode, session_id);

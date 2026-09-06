@@ -1,5 +1,3 @@
-use std::collections::HashSet;
-
 use rmcp::{
     Json, ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -9,12 +7,12 @@ use rmcp::{
 use tracing::error;
 
 use crate::{
+    activities,
     db::SharedStore,
-    evidence,
     model::{
-        DomainResult, LearningContextRequest, ObservationInput, PracticeBriefRequest,
-        RecentPracticeRequest, RecordPracticeSessionRequest, ReviewQueueRequest, TaxonomyRequest,
-        UpsertConceptRequest, UpsertWeaknessRequest,
+        DomainResult, LearningContextRequest, PracticeBriefRequest, RecentPracticeRequest,
+        RecordPracticeSessionRequest, RecordPracticeSessionResponse, ReviewQueueRequest,
+        TaxonomyRequest, UpsertConceptRequest, UpsertWeaknessRequest,
     },
 };
 
@@ -61,19 +59,28 @@ impl LearningServer {
         }
         Ok(())
     }
-    fn observation(o: &ObservationInput) -> Result<(), String> {
-        if o.observation_no.is_none() {
-            return Err("observation_no is required and must be unique across the session".into());
-        }
-        Self::text(&o.weakness_key, "weakness_key", 160)?;
-        Self::optional(o.produced.as_deref(), "produced", 2_000)?;
-        Self::optional(o.correction.as_deref(), "correction", 2_000)?;
-        Self::optional(o.error_span.as_deref(), "error_span", 1_000)?;
-        Self::optional(o.notes.as_deref(), "observation.notes", 2_000)
-    }
     fn operation_error(operation: &'static str, err: anyhow::Error) -> String {
         error!(operation,error=%err,"learning database operation failed");
         format!("{operation} failed; the server log contains the diagnostic detail")
+    }
+    fn record_operation_error(error: crate::db::RecordPracticeError) -> String {
+        match error {
+            crate::db::RecordPracticeError::InvalidArgument(message) => {
+                format!("invalid_argument: {message}")
+            }
+            crate::db::RecordPracticeError::UnknownReference(message) => {
+                format!("unknown_reference: {message}")
+            }
+            crate::db::RecordPracticeError::IdempotencyConflict => {
+                "idempotency_conflict: idempotency_key was already used with a different payload"
+                    .into()
+            }
+            crate::db::RecordPracticeError::Internal(error) => {
+                error!(operation = "record_practice_session", error = %error, "learning database operation failed");
+                "record_practice_session failed; the server log contains the diagnostic detail"
+                    .into()
+            }
+        }
     }
     fn domain(data: serde_json::Value) -> Json<DomainResult> {
         Json(DomainResult { data })
@@ -144,7 +151,7 @@ impl LearningServer {
             return Err("limit must be between 1 and 50".into());
         }
         Self::optional(request.skill.as_deref(), "skill", 120)?;
-        Self::list(request.exercise_types.as_ref(), "exercise_types", 12)?;
+        Self::list(request.exercise_type_keys.as_ref(), "exercise_type_keys", 6)?;
         Self::list(request.drill_types.as_ref(), "drill_types", 12)?;
         Self::list(request.weakness_keys.as_ref(), "weakness_keys", 20)?;
         Self::list(request.categories.as_ref(), "categories", 10)?;
@@ -152,6 +159,14 @@ impl LearningServer {
         Self::list(request.scheme_keys.as_ref(), "scheme_keys", 10)?;
         Self::list(request.collection_keys.as_ref(), "collection_keys", 20)?;
         Self::list(request.target_types.as_ref(), "target_types", 8)?;
+        Self::list(request.activity_types.as_ref(), "activity_types", 10)?;
+        Self::list(request.response_modes.as_ref(), "response_modes", 2)?;
+        if request.activity_types.as_ref().is_some_and(Vec::is_empty) {
+            return Err("activity_types must not be an empty list".into());
+        }
+        if request.response_modes.as_ref().is_some_and(Vec::is_empty) {
+            return Err("response_modes must not be an empty list".into());
+        }
         for key in request
             .concept_keys
             .iter()
@@ -167,9 +182,7 @@ impl LearningServer {
         for category in request.categories.iter().flatten() {
             Self::text(category, "category", 80)?;
         }
-        for v in request.exercise_types.iter().flatten() {
-            Self::text(v, "exercise_type", 120)?;
-        }
+
         for v in request.weakness_keys.iter().flatten() {
             Self::text(v, "weakness_key", 160)?;
         }
@@ -199,6 +212,19 @@ impl LearningServer {
         Parameters(request): Parameters<PracticeBriefRequest>,
     ) -> Result<Json<DomainResult>, String> {
         let mix = request.drill_mix.unwrap_or(crate::model::DrillMix::Auto);
+        if request.activity_type.is_some()
+            && matches!(
+                mix,
+                crate::model::DrillMix::TranslationOnly
+                    | crate::model::DrillMix::RecognitionToProduction
+                    | crate::model::DrillMix::Fluency
+            )
+        {
+            return Err(format!(
+                "drill_mix {:?} is incompatible with activity requests",
+                mix
+            ));
+        }
         match mix {
             crate::model::DrillMix::Custom
                 if request
@@ -215,6 +241,34 @@ impl LearningServer {
         }
         if request.count.is_some_and(|x| x == 0 || x > 20) {
             return Err("count must be between 1 and 20".into());
+        }
+        if request
+            .planned_duration_seconds
+            .is_some_and(|x| !(1..=7_200).contains(&x))
+        {
+            return Err("planned_duration_seconds must be between 1 and 7200".into());
+        }
+        if request.activity_type.is_none() && request.planned_duration_seconds.is_some() {
+            return Err("planned_duration_seconds requires activity_type".into());
+        }
+        if let Some(activity_type) = request.activity_type {
+            if activities::is_single_response(activity_type)
+                && request.count.is_some_and(|value| value != 1)
+            {
+                return Err(format!("{} requires count=1", activity_type.as_str()));
+            }
+            if let Some(config) = &request.activity_config {
+                activities::validate_config_fields(activity_type, config)
+                    .map_err(|e| e.to_string())?;
+                activities::validate_config_bounds(config).map_err(|e| e.to_string())?;
+                if config.is_empty() {
+                    return Err(
+                        "activity config must contain at least one field when supplied".into(),
+                    );
+                }
+            }
+        } else if request.activity_config.is_some() {
+            return Err("activity_config requires activity_type".into());
         }
         Self::list(
             request.allowed_drill_types.as_ref(),
@@ -256,137 +310,24 @@ impl LearningServer {
 
     #[tool(
         name = "record_practice_session",
+        description = "Atomically record one completed practice session. Use one exact canonical exercise_type_key and session-wide observation numbers. Retrying an identical request returns status=replayed; a changed request with the same idempotency_key conflicts.",
         annotations(
             title = "Record practice session",
             read_only_hint = false,
             destructive_hint = false,
-            open_world_hint = false
+            open_world_hint = false,
+            idempotent_hint = true
         )
     )]
     pub async fn record_practice_session(
         &self,
         Parameters(request): Parameters<RecordPracticeSessionRequest>,
-    ) -> Result<Json<DomainResult>, String> {
-        Self::text(&request.idempotency_key, "idempotency_key", 128)?;
-        Self::text(&request.exercise_type, "exercise_type", 120)?;
-        Self::optional(request.session_date.as_deref(), "session_date", 10)?;
-        Self::optional(request.reviewed_at.as_deref(), "reviewed_at", 64)?;
-        Self::optional(request.topic.as_deref(), "topic", 500)?;
-        Self::optional(request.notes.as_deref(), "notes", 4_000)?;
-        if request.items.len() > 100
-            || request.attempts.len() > 100
-            || request.new_weaknesses.len() > 100
-            || request.reviews.len() > 100
-        {
-            return Err(
-                "a session may contain at most 100 items, attempts, weaknesses, and reviews".into(),
-            );
-        }
-        let mut item_n = HashSet::new();
-        let mut attempts_n = HashSet::new();
-        let mut observations = request.observations.len();
-        for w in &request.new_weaknesses {
-            Self::text(&w.key, "new_weakness.key", 160)?;
-            Self::text(&w.category, "new_weakness.category", 80)?;
-            Self::text(&w.description, "new_weakness.description", 1_000)?;
-            Self::optional(
-                w.target_pattern.as_deref(),
-                "new_weakness.target_pattern",
-                1_000,
-            )?;
-            Self::list(
-                w.recommended_drill_types.as_ref(),
-                "recommended_drill_types",
-                12,
-            )?;
-            Self::list(Some(&w.concept_links), "concept_links", 20)?;
-            Self::list(Some(&w.target_relations), "target_relations", 20)?;
-            for link in &w.concept_links {
-                Self::text(&link.concept_key, "concept_link.concept_key", 160)?;
-            }
-            for relation in &w.target_relations {
-                Self::text(
-                    &relation.other_weakness_key,
-                    "target_relation.other_weakness_key",
-                    160,
-                )?;
-                Self::text(&relation.predicate, "target_relation.predicate", 40)?;
-                Self::optional(relation.notes.as_deref(), "target_relation.notes", 2_000)?;
-            }
-        }
-        for item in &request.items {
-            if item.item_no == 0 || !item_n.insert(item.item_no) {
-                return Err("item_no values must be unique integers of at least 1".into());
-            }
-            Self::text(&item.prompt, "item.prompt", 4_000)?;
-            Self::optional(item.response.as_deref(), "item.response", 8_000)?;
-            Self::optional(
-                item.corrected_response.as_deref(),
-                "item.corrected_response",
-                8_000,
-            )?;
-            Self::optional(
-                item.reference_answer.as_deref(),
-                "item.reference_answer",
-                8_000,
-            )?;
-            Self::optional(item.feedback.as_deref(), "item.feedback", 4_000)?;
-            Self::list(Some(&item.target_weakness_keys), "target_weakness_keys", 20)?;
-            for key in &item.target_weakness_keys {
-                Self::text(key, "target_weakness_key", 160)?;
-            }
-            observations += item.observations.len();
-            for o in &item.observations {
-                Self::observation(o)?;
-            }
-        }
-        for a in &request.attempts {
-            if a.attempt_no == 0 || !attempts_n.insert(a.attempt_no) {
-                return Err("attempt_no values must be unique integers of at least 1".into());
-            }
-            if a.practice_item_no.is_some_and(|n| !item_n.contains(&n)) {
-                return Err("attempt references an unknown practice item".into());
-            }
-            Self::text(&a.transcript, "attempt.transcript", 8_000)?;
-            if a.target_duration_seconds.is_some_and(|n| n == 0) {
-                return Err("target_duration_seconds must be positive".into());
-            }
-            observations += a.observations.len();
-            for o in &a.observations {
-                Self::observation(o)?;
-            }
-        }
-        for o in &request.observations {
-            Self::observation(o)?;
-        }
-        evidence::validate_session_observation_numbers(&request).map_err(|e| e.to_string())?;
-        if observations > 300 {
-            return Err("a session may contain at most 300 observations".into());
-        }
-        for r in &request.reviews {
-            Self::text(&r.weakness_key, "review.weakness_key", 160)?;
-            if !r.evidence.is_null() && !r.evidence.is_object() {
-                return Err("review evidence must be a JSON object".into());
-            }
-            if serde_json::to_string(&r.evidence)
-                .map(|s| s.len() > 4_096)
-                .unwrap_or(true)
-            {
-                return Err("review evidence must be at most 4096 bytes".into());
-            }
-        }
-        let payload = serde_json::to_value(&request).map_err(|e| e.to_string())?;
-        if serde_json::to_vec(&payload)
-            .map(|x| x.len() > 65_536)
-            .unwrap_or(true)
-        {
-            return Err("serialized practice session must be at most 64 KiB".into());
-        }
+    ) -> Result<Json<DomainResult<RecordPracticeSessionResponse>>, String> {
         self.store
-            .record_practice_json(payload)
+            .record_practice(request)
             .await
-            .map(Self::domain)
-            .map_err(|e| Self::operation_error("record_practice_session", e))
+            .map(|data| Json(DomainResult { data }))
+            .map_err(Self::record_operation_error)
     }
 
     #[tool(
@@ -561,7 +502,7 @@ impl LearningServer {
 #[tool_handler(router=self.tool_router)]
 impl ServerHandler for LearningServer {
     fn get_info(&self) -> ServerInfo {
-        let mut info=ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions("Use these tools only for the configured single-learner Spanish database. Start with get_learning_context or get_practice_brief. Let ChatGPT generate exercise language, record each item separately, and supply one explicit FSRS rating per deliberately reviewed weakness. Never ask for project IDs, database names, tables, schemas, or SQL.");
+        let mut info=ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions("Use these tools only for the configured single-learner Spanish database. Start with get_learning_context or get_practice_brief for a planned activity. ChatGPT generates and presents exercise language; record each learner-facing prompt or turn separately. Spoken responses are stored as transcripts only: never infer audio properties or timing from transcript text. Timing and hesitation data must be explicitly learner-reported or externally measured. Record deliberate FSRS reviews under the existing evidence rules. Never ask for project IDs, database names, tables, schemas, or SQL.");
         info.server_info = Implementation::new("aprendiendo-mcp", env!("CARGO_PKG_VERSION"))
             .with_title("Aprendiendo Español")
             .with_description("Project-scoped Spanish learning history and FSRS weakness tools");

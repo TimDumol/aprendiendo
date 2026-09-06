@@ -37,7 +37,50 @@ The server creates and upgrades its SQLite tables from [`sql/sqlite_schema.sql`]
 DATABASE_PATH=data/aprendiendo.sqlite3
 ```
 
-The migrated database retains the original application tables and adds taxonomy, evidence, immutable FSRS audit state, practice items/targets, and `recorded_requests` for idempotency. The migration runner validates the exact live snapshot before changing it.
+The migrated database retains the original application tables and adds taxonomy, evidence, immutable FSRS audit state, activity runs/stimuli, practice items/targets, and `recorded_requests` for idempotency. Activity stimuli are bounded text or references; the server never stores or fetches binary media. The migration runner validates the exact live snapshot before changing it.
+
+### Canonical practice-session contract
+
+`record_practice_session` accepts exactly one required enum-valued
+`exercise_type_key`. The catalog is:
+
+| Key | Display label |
+| --- | --- |
+| `fluency_4_3_2` | `4-3-2` |
+| `production_drill` | `production drill` |
+| `translation_drill` | `translation drill` |
+| `dele_a2_oral_microdrill` | `DELE A2 oral microdrill` |
+| `agreement_disagreement_drill` | `agreement/disagreement drill` |
+| `guided_conversation` | `guided conversation` |
+
+The smallest useful request is:
+
+```json
+{
+  "idempotency_key": "session-20260905-01",
+  "exercise_type_key": "translation_drill",
+  "items": [{
+    "item_no": 1,
+    "drill_type": "translation",
+    "prompt": "I am tired.",
+    "response": "Estoy cansado.",
+    "outcome": "correct"
+  }]
+}
+```
+
+Omitted `reviewed_at` uses the current time, and omitted `session_date` uses
+its scheduler-derived learning day. Lists default to empty; `topic` and
+`notes` are optional. Observation numbers are required and unique across the
+whole request, including item, attempt, and session observations.
+
+Successful calls return `status: "created"`. An exact retry with the same
+`idempotency_key` and canonical request returns the same data with
+`status: "replayed"`; changing the payload returns an idempotency conflict.
+The one-time version-9 migration clears `recorded_requests` because it is
+retry metadata, while retaining sessions and all learning data. Stop the MCP
+service before applying that production migration so no request straddles the
+ledger reset. The removed legacy request/storage field is not accepted.
 
 ## Spaced repetition
 
@@ -48,6 +91,10 @@ returns exact recent prompts to avoid; ChatGPT supplies the exercise language.
 `record_practice_session` stores each item, target, attempt, and raw observation
 atomically, then applies at most one explicit rating per deliberately reviewed
 weakness. Incidental observations are retained without changing FSRS state.
+Activity-aware briefs describe one of the ten supported activities and allocate
+compatible drill items. Record each learner-facing turn separately. Spoken
+answers are transcript-only; timing and hesitation data must be explicitly
+reported or externally measured and are never inferred from transcript text.
 Legacy scheduler columns remain for compatibility but are no longer updated.
 Existing databases are upgraded in place; legacy observations remain historical
 evidence and never become inferred FSRS reviews.

@@ -2,12 +2,14 @@
 //! before the latest-schema DDL is considered, so opening a database can never
 //! turn a partially migrated database into an apparently current one.
 
-use crate::{fsrs_adapter, taxonomy};
+use crate::{activities, fsrs_adapter, taxonomy};
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, SecondsFormat, Utc};
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params, types::ValueRef};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, HashMap};
 
-const LATEST_VERSION: i64 = 7;
+const LATEST_VERSION: i64 = 9;
 const MIGRATIONS: &[(i64, &str, &str)] = &[
     (3, "003_baseline_snapshot", "aprendiendo-schema-3-snapshot"),
     (4, "004_taxonomy_graph", "aprendiendo-taxonomy-graph-v1"),
@@ -21,6 +23,12 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         7,
         "007_operational_cleanup",
         "aprendiendo-operational-cleanup-v1",
+    ),
+    (8, "008_activity_runs", "aprendiendo-activity-runs-v1"),
+    (
+        9,
+        "009_canonical_record_practice_session",
+        "aprendiendo-canonical-record-practice-session-v1",
     ),
 ];
 
@@ -53,7 +61,11 @@ pub fn run(c: &mut Connection) -> Result<()> {
             continue;
         }
         if !migration_applied(c, version)? {
-            apply_migration(c, version)?;
+            if version == 9 {
+                apply_migration9(c)?;
+            } else {
+                apply_migration(c, version)?;
+            }
         }
     }
     postflight(c)
@@ -62,15 +74,15 @@ pub fn run(c: &mut Connection) -> Result<()> {
 fn initialize_latest(c: &mut Connection) -> Result<()> {
     let tx = c.transaction()?;
     tx.execute_batch(include_str!("../sql/sqlite_schema.sql"))?;
-    seed_exercise_types(&tx)?;
+    seed_activity_types(&tx)?;
     seed_taxonomy(&tx)?;
     insert_default_scheduler(&tx)?;
     for &(version, _, _) in MIGRATIONS {
         record_version(&tx, version)?;
     }
     tx.execute(
-        "INSERT INTO schema_meta(key,value) VALUES('schema_version','7')
-         ON CONFLICT(key) DO UPDATE SET value='7'",
+        "INSERT INTO schema_meta(key,value) VALUES('schema_version','9')
+         ON CONFLICT(key) DO UPDATE SET value='9'",
         [],
     )?;
     tx.commit()?;
@@ -81,15 +93,15 @@ fn initialize_legacy_catalog(c: &mut Connection) -> Result<()> {
     let tx = c.transaction()?;
     add_legacy_columns(&tx)?;
     tx.execute_batch(include_str!("../sql/sqlite_schema.sql"))?;
-    seed_exercise_types(&tx)?;
+    seed_activity_types(&tx)?;
     seed_taxonomy(&tx)?;
     insert_default_scheduler(&tx)?;
     for &(version, _, _) in MIGRATIONS {
         record_version(&tx, version)?;
     }
     tx.execute(
-        "INSERT INTO schema_meta(key,value) VALUES('schema_version','7')
-         ON CONFLICT(key) DO UPDATE SET value='7'",
+        "INSERT INTO schema_meta(key,value) VALUES('schema_version','9')
+         ON CONFLICT(key) DO UPDATE SET value='9'",
         [],
     )?;
     tx.commit()?;
@@ -166,9 +178,16 @@ fn apply_migration(c: &mut Connection, version: i64) -> Result<()> {
         5 => migration_evidence(&tx)?,
         6 => migration_scheduler(&tx)?,
         7 => migration_cleanup(&tx)?,
+        8 => migration_activities(&tx)?,
+        9 => unreachable!("migration 9 uses the connection-level migration path"),
         _ => bail!("unsupported migration version {version}"),
     }
     record_version(&tx, version)?;
+    tx.execute(
+        "INSERT INTO schema_meta(key,value) VALUES('schema_version',?1)
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        [version.to_string()],
+    )?;
     tx.commit()?;
     postflight_at(c, version).with_context(|| format!("postflight after migration {version}"))
 }
@@ -377,6 +396,489 @@ fn migration_cleanup(tx: &Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
+const MIGRATION9_CANONICAL_KEYS: &[&str] = &[
+    "fluency_4_3_2",
+    "production_drill",
+    "translation_drill",
+    "dele_a2_oral_microdrill",
+    "agreement_disagreement_drill",
+    "guided_conversation",
+];
+
+fn migration9_mapping(value: &str) -> Option<&'static str> {
+    match value {
+        "4-3-2" | "fluency_4_3_2" => Some("fluency_4_3_2"),
+        "production drill" | "production_drill" => Some("production_drill"),
+        "translation_drill" | "translation drill" => Some("translation_drill"),
+        "DELE A2 oral microdrill" | "dele_a2_oral_microdrill" => Some("dele_a2_oral_microdrill"),
+        "agreement/disagreement drill" | "agreement_disagreement_drill" => {
+            Some("agreement_disagreement_drill")
+        }
+        "guided conversation drill" | "guided conversation" | "guided_conversation" => {
+            Some("guided_conversation")
+        }
+        _ => None,
+    }
+}
+
+fn migration9_preflight(c: &Connection) -> Result<()> {
+    let mut stmt = c.prepare("SELECT exercise_type_key,exercise_type FROM sessions")?;
+    let mut offending = std::collections::BTreeSet::new();
+    for row in stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, Option<String>>(0)?,
+            row.get::<_, Option<String>>(1)?,
+        ))
+    })? {
+        let (key, historical) = row?;
+        let valid = key
+            .as_deref()
+            .is_some_and(|value| MIGRATION9_CANONICAL_KEYS.contains(&value))
+            || key.is_none() && historical.as_deref().and_then(migration9_mapping).is_some();
+        if !valid {
+            offending.insert(key.or(historical).unwrap_or_else(|| "<NULL>".to_owned()));
+        }
+    }
+    let offending = offending.into_iter().collect::<Vec<_>>();
+    if !offending.is_empty() {
+        bail!(
+            "migration 9 preflight found unmappable sessions.exercise_type values: {}",
+            offending.join(", ")
+        );
+    }
+    Ok(())
+}
+
+struct Migration9Snapshot {
+    counts: BTreeMap<String, i64>,
+}
+
+fn migration9_snapshot(c: &Connection) -> Result<Migration9Snapshot> {
+    let mut counts = BTreeMap::new();
+    for table in user_table_names(c)? {
+        if matches!(
+            table.as_str(),
+            "recorded_requests" | "schema_migrations" | "schema_meta" | "exercise_types"
+        ) {
+            continue;
+        }
+        let count: i64 = c.query_row(
+            &format!("SELECT count(*) FROM {}", quote_identifier(&table)),
+            [],
+            |row| row.get(0),
+        )?;
+        counts.insert(table, count);
+    }
+    Ok(Migration9Snapshot { counts })
+}
+
+fn migration9_copy_and_finalize(tx: &Transaction<'_>) -> Result<()> {
+    tx.execute_batch(
+        "UPDATE sessions
+         SET exercise_type_key = CASE exercise_type
+           WHEN '4-3-2' THEN 'fluency_4_3_2'
+           WHEN 'fluency_4_3_2' THEN 'fluency_4_3_2'
+           WHEN 'production drill' THEN 'production_drill'
+           WHEN 'production_drill' THEN 'production_drill'
+           WHEN 'translation_drill' THEN 'translation_drill'
+           WHEN 'translation drill' THEN 'translation_drill'
+           WHEN 'DELE A2 oral microdrill' THEN 'dele_a2_oral_microdrill'
+           WHEN 'dele_a2_oral_microdrill' THEN 'dele_a2_oral_microdrill'
+           WHEN 'agreement/disagreement drill' THEN 'agreement_disagreement_drill'
+           WHEN 'agreement_disagreement_drill' THEN 'agreement_disagreement_drill'
+           WHEN 'guided conversation drill' THEN 'guided_conversation'
+           WHEN 'guided conversation' THEN 'guided_conversation'
+           WHEN 'guided_conversation' THEN 'guided_conversation'
+         END
+         WHERE exercise_type_key IS NULL;
+         CREATE TABLE sessions_new (
+           id INTEGER PRIMARY KEY,
+           session_date TEXT NOT NULL DEFAULT (date('now')),
+           exercise_type_key TEXT NOT NULL CHECK (exercise_type_key IN (
+             'fluency_4_3_2','production_drill','translation_drill',
+             'dele_a2_oral_microdrill','agreement_disagreement_drill',
+             'guided_conversation'
+           )),
+           topic TEXT,
+           notes TEXT,
+           created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+         );
+         INSERT INTO sessions_new(id,session_date,exercise_type_key,topic,notes,created_at)
+           SELECT id,session_date,exercise_type_key,topic,notes,created_at FROM sessions;
+         DELETE FROM recorded_requests;
+         DROP TABLE sessions;
+         ALTER TABLE sessions_new RENAME TO sessions;
+         DROP TABLE exercise_types;",
+    )?;
+    let missing: i64 = tx.query_row(
+        "SELECT count(*) FROM sessions WHERE exercise_type_key IS NULL OR exercise_type_key NOT IN (
+          'fluency_4_3_2','production_drill','translation_drill',
+          'dele_a2_oral_microdrill','agreement_disagreement_drill','guided_conversation'
+        )",
+        [],
+        |row| row.get(0),
+    )?;
+    if missing != 0 {
+        bail!("migration 9 produced {missing} non-canonical session keys");
+    }
+    Ok(())
+}
+
+fn migration9_counts_match(c: &Connection, snapshot: &Migration9Snapshot) -> Result<()> {
+    for (table, expected) in &snapshot.counts {
+        let actual: i64 = c.query_row(
+            &format!("SELECT count(*) FROM {}", quote_identifier(table)),
+            [],
+            |row| row.get(0),
+        )?;
+        if actual != *expected {
+            bail!("migration 9 changed row count for {table}: {actual}, expected {expected}");
+        }
+    }
+    let ledger_count: i64 = c.query_row("SELECT count(*) FROM recorded_requests", [], |row| {
+        row.get(0)
+    })?;
+    if ledger_count != 0 {
+        bail!("migration 9 did not clear recorded_requests");
+    }
+    Ok(())
+}
+
+fn apply_migration9(c: &mut Connection) -> Result<()> {
+    let snapshot = migration9_snapshot(c)?;
+    migration9_preflight(c)?;
+    c.execute_batch("PRAGMA foreign_keys=OFF")?;
+    let migration = (|| -> Result<()> {
+        let tx = c.transaction()?;
+        migration9_copy_and_finalize(&tx)?;
+        record_version(&tx, 9)?;
+        tx.execute(
+            "INSERT INTO schema_meta(key,value) VALUES('schema_version','9')
+             ON CONFLICT(key) DO UPDATE SET value='9'",
+            [],
+        )?;
+        tx.commit()?;
+        Ok(())
+    })();
+    let restored = c.execute_batch("PRAGMA foreign_keys=ON");
+    match (migration, restored) {
+        (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(restore_error)) => Err(error.context(format!(
+            "migration 9 failed and restoring foreign_keys also failed: {restore_error}"
+        ))),
+        (Ok(()), Err(error)) => {
+            Err(anyhow!(error).context("migration 9 could not restore foreign_keys"))
+        }
+        (Ok(()), Ok(())) => {
+            let foreign_keys: i64 = c.query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
+            if foreign_keys != 1 {
+                bail!("migration 9 did not restore foreign_keys=ON");
+            }
+            migration9_counts_match(c, &snapshot)
+        }
+    }
+}
+
+struct Migration8Snapshot {
+    counts: HashMap<String, i64>,
+    projections: HashMap<String, (Vec<String>, String)>,
+}
+
+fn migration8_snapshot(tx: &Transaction<'_>) -> Result<Migration8Snapshot> {
+    let tables = user_table_names(tx)?;
+    let mut counts = HashMap::new();
+    for table in &tables {
+        let count: i64 =
+            tx.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))?;
+        counts.insert(table.clone(), count);
+    }
+    let mut projections = HashMap::new();
+    for table in [
+        "practice_items",
+        "practice_item_targets",
+        "attempts",
+        "observations",
+        "review_observations",
+    ] {
+        let columns = table_columns(tx, table)?;
+        projections.insert(
+            table.to_owned(),
+            (
+                columns.clone(),
+                table_projection_digest(tx, table, &columns)?,
+            ),
+        );
+    }
+    Ok(Migration8Snapshot {
+        counts,
+        projections,
+    })
+}
+
+fn user_table_names(c: &Connection) -> Result<Vec<String>> {
+    Ok(c
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")?
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<Vec<String>>>()?)
+}
+
+fn table_columns(c: &Connection, table: &str) -> Result<Vec<String>> {
+    Ok(c.prepare(&format!("PRAGMA table_info({table})"))?
+        .query_map([], |r| r.get(1))?
+        .collect::<rusqlite::Result<Vec<String>>>()?)
+}
+
+fn quote_identifier(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+fn table_projection_digest(c: &Connection, table: &str, columns: &[String]) -> Result<String> {
+    let selected = columns
+        .iter()
+        .map(|column| quote_identifier(column))
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut info = c.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut primary_columns = info
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(1)?, row.get::<_, i64>(5)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|(_, position)| *position > 0)
+        .collect::<Vec<_>>();
+    primary_columns.sort_by_key(|(_, position)| *position);
+    let order = if primary_columns.is_empty() {
+        "rowid".to_owned()
+    } else {
+        primary_columns
+            .iter()
+            .map(|(column, _)| quote_identifier(column))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let mut stmt = c.prepare(&format!(
+        "SELECT {selected} FROM {} ORDER BY {order}",
+        quote_identifier(table)
+    ))?;
+    let mut rows = stmt.query([])?;
+    let mut digest = Sha256::new();
+    while let Some(row) = rows.next()? {
+        for index in 0..columns.len() {
+            let value = row.get_ref(index)?;
+            let (tag, bytes): (u8, Vec<u8>) = match value {
+                ValueRef::Null => (0, Vec::new()),
+                ValueRef::Integer(value) => (1, value.to_le_bytes().to_vec()),
+                ValueRef::Real(value) => (2, value.to_bits().to_le_bytes().to_vec()),
+                ValueRef::Text(value) => (3, value.to_vec()),
+                ValueRef::Blob(value) => (4, value.to_vec()),
+            };
+            digest.update([tag]);
+            digest.update((bytes.len() as u64).to_le_bytes());
+            digest.update(bytes);
+        }
+    }
+    Ok(digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+fn migration8_precommit_checks(tx: &Transaction<'_>, snapshot: &Migration8Snapshot) -> Result<()> {
+    for (table, expected) in &snapshot.counts {
+        let actual: i64 =
+            tx.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))?;
+        if actual != *expected {
+            bail!("migration 8 changed row count for {table}: {actual}, expected {expected}");
+        }
+    }
+    for (table, (columns, expected)) in &snapshot.projections {
+        let actual = table_projection_digest(tx, table, columns)?;
+        if actual != *expected {
+            bail!("migration 8 changed legacy values in {table}");
+        }
+    }
+    let bad_defaults: i64 = tx.query_row(
+        "SELECT count(*) FROM practice_items WHERE activity_run_id IS NOT NULL OR item_phase <> 'initial'",
+        [],
+        |r| r.get(0),
+    )?;
+    if bad_defaults != 0 {
+        bail!("migration 8 did not preserve legacy practice-item defaults");
+    }
+    let active_activities: i64 = tx.query_row(
+        "SELECT count(*) FROM activity_types WHERE active=1",
+        [],
+        |r| r.get(0),
+    )?;
+    let activity_count: i64 =
+        tx.query_row("SELECT count(*) FROM activity_types", [], |r| r.get(0))?;
+    if active_activities != 10 || activity_count != 10 {
+        bail!("migration 8 did not seed all ten active activity types");
+    }
+    let integrity: String = tx.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
+    if integrity != "ok" {
+        bail!("SQLite integrity_check failed during migration 8: {integrity}");
+    }
+    if tx
+        .prepare("PRAGMA foreign_key_check")?
+        .query([])?
+        .next()?
+        .is_some()
+    {
+        bail!("SQLite foreign_key_check failed during migration 8");
+    }
+    Ok(())
+}
+
+fn migration_activities(tx: &Transaction<'_>) -> Result<()> {
+    let snapshot = migration8_snapshot(tx)?;
+    tx.execute_batch(
+        "CREATE TABLE activity_types (
+          key TEXT PRIMARY KEY,
+          label TEXT NOT NULL,
+          interaction_mode TEXT NOT NULL CHECK (interaction_mode IN ('single_response','sprint','multi_turn')),
+          active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0,1))
+        );
+        CREATE TABLE activity_runs (
+          id INTEGER PRIMARY KEY,
+          session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+          run_no INTEGER NOT NULL CHECK (run_no >= 1),
+          activity_type_key TEXT NOT NULL REFERENCES activity_types(key),
+          planned_duration_seconds INTEGER CHECK (planned_duration_seconds IS NULL OR planned_duration_seconds > 0),
+          actual_duration_milliseconds INTEGER CHECK (actual_duration_milliseconds IS NULL OR actual_duration_milliseconds > 0),
+          timing_source TEXT CHECK (timing_source IS NULL OR timing_source IN ('learner_reported','external_timer','client_measured')),
+          config_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(config_json) AND json_type(config_json)='object'),
+          notes TEXT,
+          created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+          UNIQUE(session_id,run_no), UNIQUE(id,session_id),
+          CHECK (actual_duration_milliseconds IS NULL OR timing_source IS NOT NULL)
+        );
+        CREATE INDEX activity_runs_type_session_idx ON activity_runs(activity_type_key,session_id);
+        CREATE TABLE practice_items_new (
+          id INTEGER PRIMARY KEY,
+          session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+          item_no INTEGER NOT NULL CHECK (item_no >= 1),
+          drill_type TEXT NOT NULL CHECK (drill_type IN ('translation','situational_response','sentence_transformation','question_answer','sentence_completion','sentence_combining','error_correction','minimal_pair_choice','dialogue_completion','micro_story','retell','fluency_4_3_2')),
+          prompt TEXT NOT NULL, prompt_fingerprint TEXT, response TEXT, corrected_response TEXT, reference_answer TEXT, feedback TEXT,
+          outcome TEXT CHECK (outcome IS NULL OR outcome IN ('incorrect','partially_correct','correct','omitted')),
+          activity_run_id INTEGER,
+          item_phase TEXT NOT NULL DEFAULT 'initial' CHECK (item_phase IN ('initial','follow_up','complication')),
+          created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+          UNIQUE(id,session_id), UNIQUE(session_id,item_no),
+          FOREIGN KEY (activity_run_id,session_id) REFERENCES activity_runs(id,session_id) ON DELETE CASCADE
+        );
+        CREATE TABLE practice_item_targets_new (
+          practice_item_id INTEGER NOT NULL REFERENCES practice_items_new(id) ON DELETE CASCADE,
+          weakness_id INTEGER NOT NULL REFERENCES weaknesses(id), PRIMARY KEY(practice_item_id,weakness_id)
+        );
+        CREATE TABLE attempts_new (
+          id INTEGER PRIMARY KEY,
+          session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+          attempt_no INTEGER NOT NULL CHECK (attempt_no >= 1),
+          practice_item_id INTEGER,
+          transcript TEXT NOT NULL,
+          target_duration_seconds INTEGER CHECK (target_duration_seconds IS NULL OR target_duration_seconds > 0),
+          actual_duration_milliseconds INTEGER CHECK (actual_duration_milliseconds IS NULL OR actual_duration_milliseconds > 0),
+          response_mode TEXT CHECK (response_mode IS NULL OR response_mode IN ('typed','spoken_transcript')),
+          response_latency_milliseconds INTEGER CHECK (response_latency_milliseconds IS NULL OR response_latency_milliseconds > 0),
+          timing_source TEXT CHECK (timing_source IS NULL OR timing_source IN ('learner_reported','external_timer','client_measured')),
+          created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+          UNIQUE(id,session_id), UNIQUE(session_id,attempt_no),
+          CHECK (response_latency_milliseconds IS NULL OR timing_source IS NOT NULL),
+          FOREIGN KEY (practice_item_id,session_id) REFERENCES practice_items_new(id,session_id) ON DELETE CASCADE
+        );
+        CREATE TABLE observations_new (
+          id INTEGER PRIMARY KEY,
+          session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+          attempt_id INTEGER,
+          practice_item_id INTEGER,
+          weakness_id INTEGER NOT NULL REFERENCES weaknesses(id),
+          observation_no INTEGER NOT NULL CHECK (observation_no >= 1),
+          outcome TEXT NOT NULL CHECK (outcome IN ('incorrect','partially_correct','correct','prompted_correct','omitted')),
+          role TEXT NOT NULL DEFAULT 'incidental' CHECK (role IN ('targeted','incidental')),
+          assessment_phase TEXT NOT NULL CHECK (assessment_phase IN ('historical','cold_retrieval','guided_practice','immediate_retry','transfer','incidental')),
+          hint_level TEXT NOT NULL DEFAULT 'none' CHECK (hint_level IN ('none','indirect','direct','answer_shown')),
+          learner_effort TEXT CHECK (learner_effort IS NULL OR learner_effort IN ('effortless','some_effort','substantial_effort','unknown')),
+          evidence_source TEXT NOT NULL DEFAULT 'assistant' CHECK (evidence_source IN ('learner','assistant','legacy')),
+          evidence_strength TEXT CHECK (evidence_strength IS NULL OR evidence_strength IN ('recognition','cued_production','controlled_production','spontaneous_production')),
+          severity TEXT CHECK (severity IS NULL OR severity IN ('minor','meaning_affecting','blocking')),
+          produced TEXT, correction TEXT, error_span TEXT, notes TEXT,
+          created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+          UNIQUE(session_id,observation_no),
+          FOREIGN KEY (attempt_id,session_id) REFERENCES attempts_new(id,session_id) ON DELETE CASCADE,
+          FOREIGN KEY (practice_item_id,session_id) REFERENCES practice_items_new(id,session_id) ON DELETE CASCADE
+        );
+        CREATE TABLE review_observations_new (
+          review_id INTEGER NOT NULL REFERENCES weakness_reviews(id) ON DELETE CASCADE,
+          observation_id INTEGER NOT NULL REFERENCES observations_new(id),
+          evidence_role TEXT NOT NULL CHECK (evidence_role IN ('initial','supporting','contradicting','transfer')),
+          PRIMARY KEY(review_id,observation_id)
+        );
+        INSERT INTO practice_items_new(id,session_id,item_no,drill_type,prompt,prompt_fingerprint,response,corrected_response,reference_answer,feedback,outcome,activity_run_id,item_phase,created_at)
+          SELECT id,session_id,item_no,drill_type,prompt,prompt_fingerprint,response,corrected_response,reference_answer,feedback,outcome,NULL,'initial',created_at FROM practice_items;
+        INSERT INTO practice_item_targets_new(practice_item_id,weakness_id)
+          SELECT practice_item_id,weakness_id FROM practice_item_targets;
+        INSERT INTO attempts_new(id,session_id,attempt_no,practice_item_id,transcript,target_duration_seconds,actual_duration_milliseconds,response_mode,response_latency_milliseconds,timing_source,created_at)
+          SELECT id,session_id,attempt_no,practice_item_id,transcript,target_duration_seconds,actual_duration_milliseconds,NULL,NULL,NULL,created_at FROM attempts;
+        INSERT INTO observations_new(id,session_id,attempt_id,practice_item_id,weakness_id,observation_no,outcome,role,assessment_phase,hint_level,learner_effort,evidence_source,evidence_strength,severity,produced,correction,error_span,notes,created_at)
+          SELECT id,session_id,attempt_id,practice_item_id,weakness_id,observation_no,outcome,role,assessment_phase,hint_level,learner_effort,evidence_source,evidence_strength,severity,produced,correction,error_span,notes,created_at FROM observations;
+        INSERT INTO review_observations_new(review_id,observation_id,evidence_role)
+          SELECT review_id,observation_id,evidence_role FROM review_observations;
+        DROP TABLE review_observations;
+        DROP TABLE observations;
+        DROP TABLE attempts;
+        DROP TABLE practice_item_targets;
+        DROP TABLE practice_items;
+        ALTER TABLE practice_items_new RENAME TO practice_items;
+        ALTER TABLE practice_item_targets_new RENAME TO practice_item_targets;
+        ALTER TABLE attempts_new RENAME TO attempts;
+        ALTER TABLE observations_new RENAME TO observations;
+        ALTER TABLE review_observations_new RENAME TO review_observations;
+        CREATE TABLE activity_stimuli (
+          id INTEGER PRIMARY KEY,
+          activity_run_id INTEGER NOT NULL REFERENCES activity_runs(id) ON DELETE CASCADE,
+          stimulus_no INTEGER NOT NULL CHECK (stimulus_no >= 1),
+          kind TEXT NOT NULL CHECK (kind IN ('situation','source_text','image_description','image_sequence_description','article_reference','media_transcript','complication')),
+          delivery_mode TEXT NOT NULL CHECK (delivery_mode IN ('read','viewed','heard_reported','conversation')),
+          content_text TEXT, source_uri TEXT, content_fingerprint TEXT,
+          created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+          UNIQUE(activity_run_id,stimulus_no),
+          CHECK ((content_text IS NOT NULL AND length(trim(content_text)) > 0) OR (source_uri IS NOT NULL AND length(trim(source_uri)) > 0))
+        );
+        CREATE INDEX activity_stimuli_run_idx ON activity_stimuli(activity_run_id,stimulus_no);
+        CREATE TABLE attempt_reflections (
+          id INTEGER PRIMARY KEY,
+          attempt_id INTEGER NOT NULL REFERENCES attempts(id) ON DELETE CASCADE,
+          reflection_no INTEGER NOT NULL CHECK (reflection_no >= 1),
+          source TEXT NOT NULL CHECK (source IN ('learner','assistant')),
+          kind TEXT NOT NULL CHECK (kind IN ('hesitation_reported','simplification_reported','retrieval_gap_reported','self_correction_reported','circumlocution_reported','general')),
+          note TEXT NOT NULL,
+          created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+          UNIQUE(attempt_id,reflection_no)
+        );
+        CREATE INDEX attempt_reflections_attempt_idx ON attempt_reflections(attempt_id,reflection_no);
+        CREATE INDEX attempts_session_id_idx ON attempts(session_id);
+        CREATE INDEX practice_items_activity_run_idx ON practice_items(activity_run_id,item_no);
+        CREATE INDEX practice_items_session_id_idx ON practice_items(session_id);
+        CREATE INDEX practice_item_targets_weakness_idx ON practice_item_targets(weakness_id,practice_item_id);
+        CREATE INDEX observations_session_id_idx ON observations(session_id);
+        CREATE INDEX observations_attempt_id_idx ON observations(attempt_id);
+        CREATE INDEX observations_weakness_id_idx ON observations(weakness_id);
+        CREATE INDEX review_observations_observation_idx ON review_observations(observation_id,review_id);
+        CREATE INDEX prompt_fingerprint_created_idx ON practice_items(prompt_fingerprint,created_at);
+        CREATE INDEX attempts_response_mode_session_idx ON attempts(response_mode,session_id);
+        CREATE TRIGGER observations_same_item_trigger
+        BEFORE INSERT ON observations
+        WHEN NEW.attempt_id IS NOT NULL AND NEW.practice_item_id IS NOT NULL
+         AND (SELECT practice_item_id FROM attempts WHERE id=NEW.attempt_id AND session_id=NEW.session_id) IS NOT NEW.practice_item_id
+        BEGIN SELECT RAISE(ABORT, 'observation attempt and practice item do not match'); END;"
+    )?;
+    seed_activity_types(tx)?;
+    migration8_precommit_checks(tx, &snapshot)
+}
+
 fn normalize_timestamps(tx: &Transaction<'_>) -> Result<()> {
     for table in ["sessions", "attempts", "observations"] {
         let mut stmt = tx.prepare(&format!("SELECT id,created_at FROM {table}"))?;
@@ -402,21 +904,15 @@ fn canonical_timestamp(value: &str) -> Result<String> {
     Ok(dt.to_rfc3339_opts(SecondsFormat::Millis, true))
 }
 
-fn seed_exercise_types(c: &Connection) -> Result<()> {
-    for (key, label) in [
-        ("fluency_4_3_2", "4-3-2"),
-        ("production_drill", "production drill"),
-        ("translation_drill", "translation drill"),
-        ("dele_a2_oral_microdrill", "DELE A2 oral microdrill"),
-        (
-            "agreement_disagreement_drill",
-            "agreement/disagreement drill",
-        ),
-        ("guided_conversation", "guided conversation"),
-    ] {
+fn seed_activity_types(c: &Connection) -> Result<()> {
+    for spec in activities::activity_catalog() {
         c.execute(
-            "INSERT OR IGNORE INTO exercise_types(key,label) VALUES(?1,?2)",
-            params![key, label],
+            "INSERT OR IGNORE INTO activity_types(key,label,interaction_mode,active) VALUES(?1,?2,?3,1)",
+            params![
+                spec.activity_type.as_str(),
+                spec.label,
+                spec.interaction_mode.as_str()
+            ],
         )?;
     }
     Ok(())
@@ -491,6 +987,14 @@ fn postflight_at(c: &Connection, expected_version: i64) -> Result<()> {
     })?;
     if applied != expected_version {
         bail!("database migration version is {applied}, expected {expected_version}");
+    }
+    let metadata: String = c.query_row(
+        "SELECT value FROM schema_meta WHERE key='schema_version'",
+        [],
+        |r| r.get(0),
+    )?;
+    if metadata.parse::<i64>().ok() != Some(expected_version) {
+        bail!("schema_meta version is {metadata}, expected {expected_version}");
     }
     taxonomy::validate_primary_links(c)?;
     Ok(())
@@ -1445,7 +1949,234 @@ mod tests {
             c.query_row("SELECT count(*) FROM schema_migrations", [], |r| r
                 .get::<_, i64>(0))
                 .unwrap(),
-            5
+            7
+        );
+        assert!(!table_exists(&c, "exercise_types").unwrap());
+        assert_eq!(
+            table_columns(&c, "sessions").unwrap(),
+            [
+                "id",
+                "session_date",
+                "exercise_type_key",
+                "topic",
+                "notes",
+                "created_at"
+            ]
+        );
+        for key in MIGRATION9_CANONICAL_KEYS {
+            c.execute("INSERT INTO sessions(exercise_type_key) VALUES(?1)", [*key])
+                .unwrap();
+        }
+        assert!(
+            c.execute(
+                "INSERT INTO sessions(exercise_type_key) VALUES('not-a-key')",
+                []
+            )
+            .is_err()
+        );
+        assert!(
+            c.execute("INSERT INTO sessions(exercise_type_key) VALUES(NULL)", [])
+                .is_err()
+        );
+        drop(c);
+        let _ = fs::remove_file(path);
+    }
+
+    fn version8_fixture() -> Option<(std::path::PathBuf, Connection)> {
+        let source =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("data/aprendiendo-live.sqlite3");
+        if !source.exists() {
+            return None;
+        }
+        let path = std::env::temp_dir().join(format!(
+            "aprendiendo-migration9-fixture-{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        fs::copy(source, &path).unwrap();
+        let mut c = Connection::open(&path).unwrap();
+        c.execute_batch(
+            "PRAGMA foreign_keys=ON;
+             CREATE TABLE schema_migrations (
+               version INTEGER PRIMARY KEY,
+               name TEXT NOT NULL UNIQUE,
+               checksum TEXT NOT NULL,
+               applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+             );",
+        )
+        .unwrap();
+        record_version(&c, 3).unwrap();
+        for version in 4..=8 {
+            apply_migration(&mut c, version).unwrap();
+        }
+        Some((path, c))
+    }
+
+    #[test]
+    fn migration9_canonicalizes_every_spelling_and_preserves_learning_data() {
+        let Some((path, mut c)) = version8_fixture() else {
+            return;
+        };
+        let mappings = [
+            (1, "4-3-2", "fluency_4_3_2"),
+            (2, "fluency_4_3_2", "fluency_4_3_2"),
+            (3, "production drill", "production_drill"),
+            (4, "production_drill", "production_drill"),
+            (5, "translation_drill", "translation_drill"),
+            (6, "translation drill", "translation_drill"),
+            (7, "DELE A2 oral microdrill", "dele_a2_oral_microdrill"),
+            (8, "dele_a2_oral_microdrill", "dele_a2_oral_microdrill"),
+            (
+                9,
+                "agreement/disagreement drill",
+                "agreement_disagreement_drill",
+            ),
+            (
+                10,
+                "agreement_disagreement_drill",
+                "agreement_disagreement_drill",
+            ),
+            (11, "guided conversation drill", "guided_conversation"),
+            (12, "guided conversation", "guided_conversation"),
+            (13, "guided_conversation", "guided_conversation"),
+        ];
+        for (id, historical, _) in mappings {
+            c.execute(
+                "UPDATE sessions SET exercise_type=?1,exercise_type_key=NULL WHERE id=?2",
+                params![historical, id],
+            )
+            .unwrap();
+        }
+        c.execute(
+            "UPDATE sessions SET exercise_type='not-a-mapping',exercise_type_key='guided_conversation' WHERE id=17",
+            [],
+        )
+        .unwrap();
+        let snapshots = migration9_snapshot(&c).unwrap();
+        let original_session: (String, Option<String>, Option<String>, String) = c
+            .query_row(
+                "SELECT session_date,topic,notes,created_at FROM sessions WHERE id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        let original_observation: (i64, String, String) = c
+            .query_row(
+                "SELECT session_id,outcome,created_at FROM observations WHERE id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+
+        apply_migration9(&mut c).unwrap();
+        postflight(&c).unwrap();
+        migration9_counts_match(&c, &snapshots).unwrap();
+        for (id, _, expected) in mappings {
+            let actual: String = c
+                .query_row(
+                    "SELECT exercise_type_key FROM sessions WHERE id=?1",
+                    [id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(actual, expected);
+        }
+        let authoritative: String = c
+            .query_row(
+                "SELECT exercise_type_key FROM sessions WHERE id=17",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(authoritative, "guided_conversation");
+        assert_eq!(
+            c.query_row(
+                "SELECT session_date,topic,notes,created_at FROM sessions WHERE id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap(),
+            original_session
+        );
+        assert_eq!(
+            c.query_row(
+                "SELECT session_id,outcome,created_at FROM observations WHERE id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap(),
+            original_observation
+        );
+        assert!(!table_exists(&c, "exercise_types").unwrap());
+        assert_eq!(
+            c.query_row("SELECT count(*) FROM recorded_requests", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            c.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        drop(c);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn migration9_preflight_rejects_unmappable_values_without_writes() {
+        let Some((path, mut c)) = version8_fixture() else {
+            return;
+        };
+        c.execute(
+            "UPDATE sessions SET exercise_type='unsupported exercise',exercise_type_key=NULL WHERE id=1",
+            [],
+        )
+        .unwrap();
+        let ledger_count: i64 = c
+            .query_row("SELECT count(*) FROM recorded_requests", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let error = apply_migration9(&mut c).unwrap_err().to_string();
+        assert!(error.contains("unsupported exercise"));
+        assert!(table_exists(&c, "exercise_types").unwrap());
+        assert!(column_exists(&c, "sessions", "exercise_type").unwrap());
+        assert_eq!(
+            c.query_row("SELECT max(version) FROM schema_migrations", [], |row| row
+                .get::<_, i64>(
+                0
+            ))
+            .unwrap(),
+            8
+        );
+        assert_eq!(
+            c.query_row(
+                "SELECT value FROM schema_meta WHERE key='schema_version'",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            "8"
+        );
+        assert_eq!(
+            c.query_row("SELECT count(*) FROM recorded_requests", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            ledger_count
+        );
+        assert_eq!(
+            c.query_row(
+                "SELECT exercise_type,exercise_type_key FROM sessions WHERE id=1",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .unwrap(),
+            ("unsupported exercise".to_owned(), None)
+        );
+        assert_eq!(
+            c.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
         );
         drop(c);
         let _ = fs::remove_file(path);
@@ -1498,7 +2229,7 @@ mod tests {
                 |r| r.get::<_, i64>(0)
             )
             .unwrap(),
-            2
+            0
         );
         let integrity: String = c
             .query_row("PRAGMA integrity_check", [], |r| r.get(0))
