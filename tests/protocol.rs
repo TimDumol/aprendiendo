@@ -278,18 +278,18 @@ use aprendiendo_mcp::config::EmbeddedOauthConfig;
 use aprendiendo_mcp::embedded_oauth::EmbeddedOauthState;
 use argon2::{
     Argon2,
-    password_hash::{PasswordHasher, SaltString, rand_core::OsRng},
+    password_hash::{PasswordHasher, SaltString},
 };
-use rsa::{RsaPrivateKey, pkcs8::EncodePrivateKey};
 use std::fs;
 
-async fn setup_embedded_oauth_app() -> (String, reqwest::Client, tokio::task::JoinHandle<()>) {
-    let rsa_key = RsaPrivateKey::new(&mut OsRng, 2048).expect("failed to generate key");
-    let pem = rsa_key.to_pkcs8_pem(rsa::pkcs8::LineEnding::LF).unwrap();
-    fs::write("/tmp/test_key.pem", pem.as_bytes()).unwrap();
+const ED25519_PRIVATE_KEY_PEM: &[u8] = b"-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIGrD/e7uKYqSY4twDEsRfMMuLSrODf14dpTiTK6K1YI0\n-----END PRIVATE KEY-----\n";
 
-    let password = "test_password";
-    let salt = SaltString::generate(&mut OsRng);
+async fn setup_embedded_oauth_app() -> (String, reqwest::Client, tokio::task::JoinHandle<()>, String)
+{
+    fs::write("/tmp/test_ed25519_key.pem", ED25519_PRIVATE_KEY_PEM).unwrap();
+
+    let password = uuid::Uuid::new_v4().to_string();
+    let salt = SaltString::from_b64("c2FsdC1mb3ItdGVzdA").unwrap();
     let password_hash = Argon2::default()
         .hash_password(password.as_bytes(), &salt)
         .unwrap()
@@ -299,7 +299,7 @@ async fn setup_embedded_oauth_app() -> (String, reqwest::Client, tokio::task::Jo
         public_base_url: "http://localhost".to_string(),
         username: "test_user".to_string(),
         password_hash,
-        rsa_private_key_path: "/tmp/test_key.pem".to_string(),
+        ed25519_private_key_path: "/tmp/test_ed25519_key.pem".to_string(),
         client_id: "test_client".to_string(),
         redirect_uri: "http://localhost/callback".to_string(),
         required_scope: "learning:access".to_string(),
@@ -344,12 +344,12 @@ async fn setup_embedded_oauth_app() -> (String, reqwest::Client, tokio::task::Jo
         .build()
         .unwrap();
 
-    (url, client, task)
+    (url, client, task, password)
 }
 
 #[tokio::test]
 async fn embedded_oauth_flow() {
-    let (base_url, client, task) = setup_embedded_oauth_app().await;
+    let (base_url, client, task, password) = setup_embedded_oauth_app().await;
 
     // 1. Metadata
     let meta: Value = client
@@ -398,7 +398,7 @@ async fn embedded_oauth_flow() {
         .post(&authorize_url)
         .form(&[
             ("username", "test_user"),
-            ("password", "test_password"),
+            ("password", password.as_str()),
             ("csrf_token", csrf_token),
             ("action", "authorize"),
         ])
@@ -442,7 +442,7 @@ async fn embedded_oauth_flow() {
         .post(&authorize_url)
         .form(&[
             ("username", "test_user"),
-            ("password", "test_password"),
+            ("password", password.as_str()),
             ("csrf_token", csrf_token),
             ("action", "authorize"),
         ])

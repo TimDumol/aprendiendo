@@ -927,7 +927,7 @@ fn seed_activity_types(c: &Connection) -> Result<()> {
 }
 
 fn insert_default_scheduler(c: &Connection) -> Result<()> {
-    c.execute("INSERT OR IGNORE INTO scheduler_parameter_sets(id,algorithm,algorithm_version,parameters_json,source) VALUES(1,'fsrs','FSRS-6',?1,'default')", [fsrs_adapter::default_parameters_json()])?;
+    c.execute("INSERT OR IGNORE INTO scheduler_parameter_sets(id,algorithm,algorithm_version,parameters_json,source) VALUES(1,'fsrs','FSRS-6',?1,'default')", [fsrs_adapter::default_parameters_json()?])?;
     c.execute("INSERT OR IGNORE INTO scheduler_config(id,active_parameter_set_id,desired_retention,timezone,day_cutoff_hour) VALUES(1,1,0.90,'Europe/Madrid',4)", [])?;
     c.execute("INSERT OR IGNORE INTO scheduler_items(weakness_id,track,active) SELECT id,'general',active FROM weaknesses", [])?;
     Ok(())

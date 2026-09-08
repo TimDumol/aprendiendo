@@ -57,11 +57,13 @@ ansible-playbook site.yml --ask-vault-pass \
 ```
 
 The playbook deliberately fails before changing the server if the Pocket ID
-subject or preserved rollback values remain placeholders. It keeps the existing
-one-time 3072-bit RSA signing key at
-`/opt/aprendiendo-mcp/secrets/oauth-signing-key.pem` for rollback; preserve this
-file or embedded-mode access tokens will stop validating after a replacement.
-The key is readable only by the container's fixed non-root UID (`65532`).
+subject or preserved rollback values remain placeholders. It provisions an
+Ed25519 signing key at
+`/opt/aprendiendo-mcp/secrets/oauth-signing-key-ed25519.pem` for the current
+embedded-OAuth rollback path. The older 3072-bit RSA key remains at
+`/opt/aprendiendo-mcp/secrets/oauth-signing-key.pem` solely so a pre-EdDSA
+release can still be restored during the observation window. Both keys are
+readable only by the container's fixed non-root UID (`65532`).
 
 In OIDC mode the public checks validate health/readiness, protected-resource
 metadata, Pocket ID discovery, PKCE/refresh support, and the unauthenticated

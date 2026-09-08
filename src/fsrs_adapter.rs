@@ -12,8 +12,8 @@ pub struct ScheduledState {
     pub interval_days: i32,
 }
 
-pub fn default_parameters_json() -> String {
-    serde_json::to_string(&fsrs::DEFAULT_PARAMETERS).expect("FSRS defaults serialize")
+pub fn default_parameters_json() -> Result<String> {
+    Ok(serde_json::to_string(&fsrs::DEFAULT_PARAMETERS)?)
 }
 
 pub fn schedule(

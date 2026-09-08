@@ -4,6 +4,7 @@ import { File as ExpoFile } from "expo-file-system";
 import { getAccessToken, PRACTICE_API_URL as AUTH_PRACTICE_API_URL } from "@/lib/auth";
 import { errorMessage, logError } from "@/lib/logging";
 import { hashBlobSha256, uriForRelativePath } from "@/lib/media/recording";
+import { allowlistedApiPath } from "@/lib/network";
 import {
   getSettings,
   listOutbox,
@@ -107,10 +108,13 @@ async function authHeaders(): Promise<Record<string, string>> {
 
 async function requestJson<T>(path: string, init: RequestInit): Promise<T> {
   assertConfigured();
+  const url = allowlistedApiPath(PRACTICE_API_URL, path);
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
   try {
-    const response = await fetch(`${PRACTICE_API_URL}${path}`, {
+    // API paths are restricted to the configured practice service origin above.
+    // foxguard: ignore[js/no-ssrf]
+    const response = await fetch(url, {
       ...init,
       headers: {
         Accept: "application/json",

@@ -1,10 +1,11 @@
 use crate::config::EmbeddedOauthConfig;
 use anyhow::{Context, Result};
-use jsonwebtoken::jwk::Jwk;
-use rsa::{RsaPrivateKey, pkcs8::DecodePrivateKey, traits::PublicKeyParts};
+use jsonwebtoken::{Algorithm, EncodingKey, jwk::Jwk};
 use std::fs;
 use std::{collections::HashMap, sync::Arc, time::Instant};
 use tokio::sync::Mutex;
+
+const SIGNING_KEY_ID: &str = "1";
 
 #[derive(Clone, Debug)]
 pub struct AuthCode {
@@ -18,48 +19,26 @@ pub struct AuthCode {
 
 pub struct EmbeddedOauthState {
     pub config: Arc<EmbeddedOauthConfig>,
-    pub rsa_private_key: RsaPrivateKey,
-    pub rsa_public_jwk: Jwk,
+    pub signing_key: EncodingKey,
+    pub public_jwk: Jwk,
     pub auth_codes: HashMap<String, AuthCode>,
 }
 
 impl EmbeddedOauthState {
     pub fn new(config: Arc<EmbeddedOauthConfig>) -> Result<Self> {
-        let pem = fs::read_to_string(&config.rsa_private_key_path)
-            .context("failed to read OAUTH_RSA_KEY_PATH")?;
-        let rsa_private_key =
-            RsaPrivateKey::from_pkcs8_pem(&pem).context("failed to parse RSA private key")?;
-
-        let jwk = Jwk {
-            common: jsonwebtoken::jwk::CommonParameters {
-                public_key_use: Some(jsonwebtoken::jwk::PublicKeyUse::Signature),
-                key_operations: None,
-                key_algorithm: Some(jsonwebtoken::jwk::KeyAlgorithm::RS256),
-                key_id: Some("1".to_string()),
-                x509_url: None,
-                x509_chain: None,
-                x509_sha1_fingerprint: None,
-                x509_sha256_fingerprint: None,
-            },
-            algorithm: jsonwebtoken::jwk::AlgorithmParameters::RSA(
-                jsonwebtoken::jwk::RSAKeyParameters {
-                    key_type: jsonwebtoken::jwk::RSAKeyType::RSA,
-                    n: base64::Engine::encode(
-                        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
-                        rsa_private_key.n().to_bytes_be(),
-                    ),
-                    e: base64::Engine::encode(
-                        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
-                        rsa_private_key.e().to_bytes_be(),
-                    ),
-                },
-            ),
-        };
+        let pem = fs::read(&config.ed25519_private_key_path)
+            .context("failed to read OAUTH_ED25519_KEY_PATH")?;
+        let signing_key =
+            EncodingKey::from_ed_pem(&pem).context("failed to parse Ed25519 private key")?;
+        let mut jwk = Jwk::from_encoding_key(&signing_key, Algorithm::EdDSA)
+            .context("failed to derive Ed25519 public JWK")?;
+        jwk.common.public_key_use = Some(jsonwebtoken::jwk::PublicKeyUse::Signature);
+        jwk.common.key_id = Some(SIGNING_KEY_ID.to_string());
 
         Ok(Self {
             config,
-            rsa_private_key,
-            rsa_public_jwk: jwk,
+            signing_key,
+            public_jwk: jwk,
             auth_codes: HashMap::new(),
         })
     }
@@ -89,7 +68,7 @@ pub async fn authorization_server_metadata(
 }
 
 pub async fn jwks(State(state): State<SharedOauthState>) -> impl IntoResponse {
-    let jwk = state.lock().await.rsa_public_jwk.clone();
+    let jwk = state.lock().await.public_jwk.clone();
     (StatusCode::OK, Json(json!({ "keys": [jwk] })))
 }
 
@@ -266,7 +245,7 @@ pub async fn authorize_post(
     Ok((jar, Redirect::to(&redirect)).into_response())
 }
 
-use jsonwebtoken::{EncodingKey, Header, encode};
+use jsonwebtoken::{Header, encode};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -358,10 +337,17 @@ pub async fn token_post(
     }
 
     // Generate JWT
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
+    let now = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(duration) => duration.as_secs(),
+        Err(error) => {
+            warn!(%error, "system clock is before the Unix epoch");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "server_error"})),
+            )
+                .into_response();
+        }
+    };
     let expires_in = 3600;
 
     let claims = JwtClaims {
@@ -372,15 +358,20 @@ pub async fn token_post(
         scope: s.config.required_scope.clone(),
     };
 
-    let mut header = Header::new(jsonwebtoken::Algorithm::RS256);
-    header.kid = Some("1".to_string());
+    let mut header = Header::new(Algorithm::EdDSA);
+    header.kid = Some(SIGNING_KEY_ID.to_string());
 
-    let pem = std::fs::read_to_string(&s.config.rsa_private_key_path)
-        .expect("failed to read private key");
-    let encoding_key =
-        EncodingKey::from_rsa_pem(pem.as_bytes()).expect("failed to create encoding key from pem");
-
-    let token = encode(&header, &claims, &encoding_key).expect("failed to sign token");
+    let token = match encode(&header, &claims, &s.signing_key) {
+        Ok(token) => token,
+        Err(error) => {
+            warn!(%error, "failed to sign OAuth access token");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "server_error"})),
+            )
+                .into_response();
+        }
+    };
 
     let response = TokenResponse {
         access_token: token,

@@ -4,8 +4,9 @@ import * as SecureStore from "expo-secure-store";
 import * as WebBrowser from "expo-web-browser";
 
 import { errorMessage, logError, logInfo, logWarn } from "@/lib/logging";
+import { allowlistedHttpUrl, configuredHttpOrigin } from "@/lib/network";
 
-const TOKEN_KEY = "aprendiendo.practice.access-token";
+const STORAGE_ID = "aprendiendo.practice.access-token";
 const DEFAULT_PRACTICE_API_URL = "https://mars.timdumol.com";
 const DEFAULT_OAUTH_ISSUER = "https://auth.aries.timdumol.com";
 const DEFAULT_OAUTH_CLIENT_ID = "aprendiendo-practice-mobile";
@@ -13,10 +14,10 @@ const DEFAULT_REDIRECT_URI = "aprendiendo-practice-mvp://oauth/callback";
 const DEFAULT_OAUTH_SCOPE = "openid profile email learning:access";
 const OAUTH_TOKEN_TIMEOUT_MS = 30_000;
 
-export const PRACTICE_API_URL = (
+export const PRACTICE_API_URL = configuredHttpOrigin(
   process.env.EXPO_PUBLIC_PRACTICE_API_URL ??
-  (process.env.EXPO_OS === "web" ? "" : DEFAULT_PRACTICE_API_URL)
-).replace(/\/+$/, "");
+    (process.env.EXPO_OS === "web" ? "" : DEFAULT_PRACTICE_API_URL),
+);
 
 WebBrowser.maybeCompleteAuthSession();
 
@@ -70,7 +71,29 @@ function environmentValue(name: string): string {
 function isHttpUrl(value: string): boolean {
   try {
     const url = new URL(value);
-    return url.protocol === "https:" || url.protocol === "http:";
+    return (
+      (url.protocol === "https:" || url.protocol === "http:") &&
+      Boolean(url.hostname) &&
+      !url.username &&
+      !url.password &&
+      !url.search &&
+      !url.hash
+    );
+  } catch {
+    return false;
+  }
+}
+
+function isAllowedOAuthEndpoint(value: string, issuer: string, pathname: string): boolean {
+  try {
+    const endpoint = new URL(value);
+    const issuerUrl = new URL(issuer);
+    return (
+      isHttpUrl(value) &&
+      isHttpUrl(issuer) &&
+      endpoint.origin === issuerUrl.origin &&
+      endpoint.pathname === pathname
+    );
   } catch {
     return false;
   }
@@ -105,13 +128,28 @@ export function getOAuthConfiguration(): OAuthConfiguration {
   if (issuer && !isHttpUrl(issuer)) issues.push(`OAuth issuer is not an HTTP(S) URL: ${issuer}`);
   if (!authorizationUrl) issues.push("EXPO_PUBLIC_OAUTH_AUTHORIZATION_URL is missing.");
   if (authorizationUrl && !isHttpUrl(authorizationUrl)) issues.push(`OAuth authorization URL is invalid: ${authorizationUrl}`);
+  if (
+    issuer &&
+    authorizationUrl &&
+    !isAllowedOAuthEndpoint(authorizationUrl, issuer, "/authorize")
+  ) {
+    issues.push("OAuth authorization URL must be the /authorize endpoint on the configured issuer.");
+  }
   if (!tokenUrl) issues.push("EXPO_PUBLIC_OAUTH_TOKEN_URL is missing.");
   if (tokenUrl && !isHttpUrl(tokenUrl)) issues.push(`OAuth token URL is invalid: ${tokenUrl}`);
+  if (issuer && tokenUrl && !isAllowedOAuthEndpoint(tokenUrl, issuer, "/api/oidc/token")) {
+    issues.push("OAuth token URL must be the /api/oidc/token endpoint on the configured issuer.");
+  }
   if (!clientId) issues.push("EXPO_PUBLIC_OAUTH_CLIENT_ID is missing.");
   if (!scope) issues.push("EXPO_PUBLIC_OAUTH_SCOPE is empty.");
   if (!redirectUri) issues.push("EXPO_PUBLIC_OAUTH_REDIRECT_URI is missing.");
   if (!resource) issues.push("EXPO_PUBLIC_OAUTH_RESOURCE is missing.");
   if (resource && !isHttpUrl(resource)) issues.push(`OAuth resource is invalid: ${resource}`);
+  if (apiUrl && resource && isHttpUrl(apiUrl) && isHttpUrl(resource)) {
+    if (new URL(resource).origin !== new URL(apiUrl).origin || new URL(resource).pathname !== new URL(apiUrl).pathname) {
+      issues.push("OAuth resource must match the configured practice API origin.");
+    }
+  }
 
   return {
     configured: issues.length === 0,
@@ -176,7 +214,15 @@ async function postToken(settings: OAuthConfiguration, body: string): Promise<Re
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), OAUTH_TOKEN_TIMEOUT_MS);
   try {
-    return await fetch(settings.tokenUrl, {
+    const issuerOrigin = new URL(settings.issuer).origin;
+    const tokenUrl = allowlistedHttpUrl(
+      settings.tokenUrl,
+      [issuerOrigin],
+      "OAuth token endpoint",
+    );
+    // The endpoint is constrained to the configured issuer and exact OAuth path above.
+    // foxguard: ignore[js/no-ssrf]
+    return await fetch(tokenUrl, {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" },
       body,
@@ -194,7 +240,7 @@ async function postToken(settings: OAuthConfiguration, body: string): Promise<Re
 
 export async function getAccessToken(): Promise<string | null> {
   try {
-    return await SecureStore.getItemAsync(TOKEN_KEY);
+    return await SecureStore.getItemAsync(STORAGE_ID);
   } catch (error) {
     logError("auth.storage", error, { operation: "read_access_token" });
     throw new AuthError(`Could not read the stored sign-in: ${errorMessage(error)}`, "secure_store_failed");
@@ -203,7 +249,7 @@ export async function getAccessToken(): Promise<string | null> {
 
 export async function clearAccessToken(): Promise<void> {
   try {
-    await SecureStore.deleteItemAsync(TOKEN_KEY);
+    await SecureStore.deleteItemAsync(STORAGE_ID);
   } catch (error) {
     logError("auth.storage", error, { operation: "delete_access_token" });
     throw new AuthError(`Could not remove the stored sign-in: ${errorMessage(error)}`, "secure_store_failed");
@@ -304,7 +350,7 @@ export async function signInWithBrowser(): Promise<void> {
     throw new AuthError("Pocket ID returned no usable access token.", "access_token_missing");
   }
   try {
-    await SecureStore.setItemAsync(TOKEN_KEY, token.access_token);
+    await SecureStore.setItemAsync(STORAGE_ID, token.access_token);
   } catch (error) {
     logError("auth.storage", error, { operation: "write_access_token" });
     throw new AuthError(`Sign-in succeeded, but the access token could not be stored securely: ${errorMessage(error)}`, "secure_store_failed");

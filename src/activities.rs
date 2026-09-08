@@ -137,9 +137,13 @@ fn config(
 }
 
 pub fn activity_catalog() -> Vec<ActivitySpec> {
-    vec![
-        ActivitySpec {
-            activity_type: ActivityType::SituationalResponse,
+    ActivityType::ALL.into_iter().map(activity_spec).collect()
+}
+
+pub fn activity_spec(activity_type: ActivityType) -> ActivitySpec {
+    match activity_type {
+        ActivityType::SituationalResponse => ActivitySpec {
+            activity_type,
             label: "Situational response",
             interaction_mode: ActivityInteractionMode::Sprint,
             default_count: 4,
@@ -149,8 +153,8 @@ pub fn activity_catalog() -> Vec<ActivitySpec> {
             intended_evidence_strength: "spontaneous_production",
             stimulus_requirements: NO_STIMULUS_REQUIREMENTS,
         },
-        ActivitySpec {
-            activity_type: ActivityType::PictureNarration,
+        ActivityType::PictureNarration => ActivitySpec {
+            activity_type,
             label: "Picture/comic narration",
             interaction_mode: ActivityInteractionMode::SingleResponse,
             default_count: 1,
@@ -160,8 +164,8 @@ pub fn activity_catalog() -> Vec<ActivitySpec> {
             intended_evidence_strength: "spontaneous_production",
             stimulus_requirements: PICTURE_REQUIREMENTS,
         },
-        ActivitySpec {
-            activity_type: ActivityType::QuestionAnswerSprint,
+        ActivityType::QuestionAnswerSprint => ActivitySpec {
+            activity_type,
             label: "Question-answer sprint",
             interaction_mode: ActivityInteractionMode::Sprint,
             default_count: 6,
@@ -171,8 +175,8 @@ pub fn activity_catalog() -> Vec<ActivitySpec> {
             intended_evidence_strength: "spontaneous_production",
             stimulus_requirements: NO_STIMULUS_REQUIREMENTS,
         },
-        ActivitySpec {
-            activity_type: ActivityType::RetellReconstruction,
+        ActivityType::RetellReconstruction => ActivitySpec {
+            activity_type,
             label: "Retell/reconstruction",
             interaction_mode: ActivityInteractionMode::SingleResponse,
             default_count: 1,
@@ -182,8 +186,8 @@ pub fn activity_catalog() -> Vec<ActivitySpec> {
             intended_evidence_strength: "spontaneous_production",
             stimulus_requirements: RETELL_REQUIREMENTS,
         },
-        ActivitySpec {
-            activity_type: ActivityType::CorrectiveConversation,
+        ActivityType::CorrectiveConversation => ActivitySpec {
+            activity_type,
             label: "Conversation with corrective feedback",
             interaction_mode: ActivityInteractionMode::MultiTurn,
             default_count: 6,
@@ -193,8 +197,8 @@ pub fn activity_catalog() -> Vec<ActivitySpec> {
             intended_evidence_strength: "spontaneous_production",
             stimulus_requirements: NO_STIMULUS_REQUIREMENTS,
         },
-        ActivitySpec {
-            activity_type: ActivityType::SentenceTransformationSprint,
+        ActivityType::SentenceTransformationSprint => ActivitySpec {
+            activity_type,
             label: "Sentence-transformation sprint",
             interaction_mode: ActivityInteractionMode::Sprint,
             default_count: 6,
@@ -204,8 +208,8 @@ pub fn activity_catalog() -> Vec<ActivitySpec> {
             intended_evidence_strength: "controlled_production",
             stimulus_requirements: NO_STIMULUS_REQUIREMENTS,
         },
-        ActivitySpec {
-            activity_type: ActivityType::Dictogloss,
+        ActivityType::Dictogloss => ActivitySpec {
+            activity_type,
             label: "Dictogloss",
             interaction_mode: ActivityInteractionMode::SingleResponse,
             default_count: 1,
@@ -215,8 +219,8 @@ pub fn activity_catalog() -> Vec<ActivitySpec> {
             intended_evidence_strength: "controlled_production",
             stimulus_requirements: RETELL_REQUIREMENTS,
         },
-        ActivitySpec {
-            activity_type: ActivityType::VoiceDiary,
+        ActivityType::VoiceDiary => ActivitySpec {
+            activity_type,
             label: "Voice diary",
             interaction_mode: ActivityInteractionMode::SingleResponse,
             default_count: 1,
@@ -226,8 +230,8 @@ pub fn activity_catalog() -> Vec<ActivitySpec> {
             intended_evidence_strength: "spontaneous_production",
             stimulus_requirements: NO_STIMULUS_REQUIREMENTS,
         },
-        ActivitySpec {
-            activity_type: ActivityType::ReadCloseExplain,
+        ActivityType::ReadCloseExplain => ActivitySpec {
+            activity_type,
             label: "Read, close, explain",
             interaction_mode: ActivityInteractionMode::SingleResponse,
             default_count: 1,
@@ -237,8 +241,8 @@ pub fn activity_catalog() -> Vec<ActivitySpec> {
             intended_evidence_strength: "spontaneous_production",
             stimulus_requirements: READ_CLOSE_REQUIREMENTS,
         },
-        ActivitySpec {
-            activity_type: ActivityType::RolePlayComplications,
+        ActivityType::RolePlayComplications => ActivitySpec {
+            activity_type,
             label: "Role-play with complications",
             interaction_mode: ActivityInteractionMode::MultiTurn,
             default_count: 4,
@@ -248,22 +252,24 @@ pub fn activity_catalog() -> Vec<ActivitySpec> {
             intended_evidence_strength: "spontaneous_production",
             stimulus_requirements: ROLE_PLAY_REQUIREMENTS,
         },
-    ]
-}
-
-pub fn activity_spec(activity_type: ActivityType) -> ActivitySpec {
-    activity_catalog()
-        .into_iter()
-        .find(|spec| spec.activity_type == activity_type)
-        .expect("ActivityType::ALL and activity_catalog must stay exhaustive")
+    }
 }
 
 pub fn is_single_response(activity_type: ActivityType) -> bool {
-    activity_spec(activity_type).interaction_mode == ActivityInteractionMode::SingleResponse
+    matches!(
+        activity_type,
+        ActivityType::PictureNarration
+            | ActivityType::RetellReconstruction
+            | ActivityType::Dictogloss
+            | ActivityType::VoiceDiary
+            | ActivityType::ReadCloseExplain
+    )
 }
 
-pub fn default_config_value(activity_type: ActivityType) -> Value {
-    serde_json::to_value(activity_spec(activity_type).default_config).expect("config serializes")
+pub fn default_config_value(activity_type: ActivityType) -> Result<Value> {
+    Ok(serde_json::to_value(
+        activity_spec(activity_type).default_config,
+    )?)
 }
 
 pub fn merged_config(
@@ -606,13 +612,17 @@ pub fn validate_activity_recording(request: &RecordPracticeSessionRequest) -> Re
             {
                 bail!("stimulus source_uri must be at most 2000 bytes")
             }
-            if stimulus.content_text.is_some()
-                && stimulus.content_text.as_deref().unwrap().trim().is_empty()
+            if stimulus
+                .content_text
+                .as_deref()
+                .is_some_and(|value| value.trim().is_empty())
             {
                 bail!("stimulus content_text must not be empty")
             }
-            if stimulus.source_uri.is_some()
-                && stimulus.source_uri.as_deref().unwrap().trim().is_empty()
+            if stimulus
+                .source_uri
+                .as_deref()
+                .is_some_and(|value| value.trim().is_empty())
             {
                 bail!("stimulus source_uri must not be empty")
             }

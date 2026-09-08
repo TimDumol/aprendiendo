@@ -26,10 +26,13 @@ echo
 TOKEN="smoke-test-token-0123456789abcdef0123456789"
 H=(-H "accept: application/json, text/event-stream" -H "content-type: application/json")
 AUTH=(-H "Authorization: Bearer $TOKEN")
-MCP="http://127.0.0.1:8080/mcp"
-[ "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$MCP" "${H[@]}" -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}')" = "401" ]
+[ "$(curl -s -o /dev/null -w '%{http_code}' -X POST --url 'http://127.0.0.1:8080/mcp' "${H[@]}" --data-binary '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}')" = "401" ]
 
-call() { curl -sf -X POST "$MCP" "${H[@]}" "${AUTH[@]}" -d "$1"; }
+call() {
+  # The URL is a fixed loopback endpoint; the argument is request data only.
+  # foxguard: ignore[bash/taint-ssrf]
+  curl -sf -X POST --url 'http://127.0.0.1:8080/mcp' "${H[@]}" "${AUTH[@]}" --data-binary "$1"
+}
 call '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"smoke","version":"1.0"}}}' >/dev/null
 tools="$(call '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}')"
 python3 -c 'import json,sys; d=json.load(sys.stdin); tools=d["result"]["tools"]; names=[x["name"] for x in tools]; assert len(names)==12 and "get_taxonomy" in names and "upsert_concept" in names, names; record=next(x for x in tools if x["name"]=="record_practice_session"); schema=record["inputSchema"]; assert "exercise_type_key" in schema["required"] and "exercise_type" not in schema["properties"]; assert record["annotations"]["idempotentHint"] is True; print(names)' <<<"$tools"

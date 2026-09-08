@@ -4,6 +4,7 @@ import * as ImageManipulator from "expo-image-manipulator";
 import * as Sharing from "expo-sharing";
 
 import type { RecordingArtifact } from "@/lib/types";
+import { allowlistedBrowserAssetUrl, localBlobUrl } from "@/lib/network";
 
 const IS_WEB = process.env.EXPO_OS === "web";
 const RECORDINGS_DIRECTORY = "recordings";
@@ -78,7 +79,11 @@ export function uriForRelativePath(relativePath: string): string {
 }
 
 async function finalizeWeb(input: CapturedRecordingInput, mimeType: string): Promise<RecordingArtifact> {
-  const response = await fetch(input.uri);
+  const recordingUrl = localBlobUrl(input.uri);
+  // The recorder is expected to provide a browser-local object URL.
+  // foxguard: ignore[js/no-ssrf]
+  const response = await fetch(recordingUrl);
+  if (!response.ok) throw new Error("The recorder returned an unreadable file.");
   const blob = await response.blob();
   if (!blob.size) throw new Error("The recorder returned an empty file.");
   const objectUrl = typeof URL === "undefined" ? undefined : URL.createObjectURL(blob);
@@ -152,7 +157,15 @@ export async function persistImageAsset(
 ): Promise<PersistedImage> {
   const normalizedMimeType = mimeType || "image/jpeg";
   if (IS_WEB) {
-    const blob = uri.startsWith("blob:") ? await (await fetch(uri)).blob() : null;
+    let blob: Blob | null = null;
+    if (uri.startsWith("blob:") || uri.startsWith("http")) {
+      const imageUrl = allowlistedBrowserAssetUrl(uri);
+      // Browser object URLs and same-origin assets are never remote destinations.
+      // foxguard: ignore[js/no-ssrf]
+      const response = await fetch(imageUrl);
+      if (!response.ok) throw new Error("The selected image could not be read.");
+      blob = await response.blob();
+    }
     return {
       uri,
       relativePath: null,

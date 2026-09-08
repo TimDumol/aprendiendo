@@ -163,10 +163,19 @@ impl Authenticator {
             bail!("JWT is too large");
         }
         let header = decode_header(token).context("invalid JWT header")?;
-        if !matches!(
-            header.alg,
-            Algorithm::RS256 | Algorithm::RS384 | Algorithm::RS512
-        ) {
+        let supported_algorithm = match self {
+            // The embedded rollback issuer signs with the Ed25519 key configured
+            // for this process. Do not accept a different algorithm for its token.
+            Self::EmbeddedOauth(..) => matches!(header.alg, Algorithm::EdDSA),
+            // Pocket ID currently uses RSA, but EdDSA is also a valid OIDC JWKS
+            // algorithm and is safe to accept when the provider publishes it.
+            Self::Oidc(_) => matches!(
+                header.alg,
+                Algorithm::EdDSA | Algorithm::RS256 | Algorithm::RS384 | Algorithm::RS512
+            ),
+            _ => false,
+        };
+        if !supported_algorithm {
             bail!("unsupported JWT signing algorithm");
         }
         let kid = header.kid.context("JWT header has no kid")?;
@@ -175,7 +184,7 @@ impl Authenticator {
             Self::EmbeddedOauth(config, auth) => {
                 let auth = auth.lock().await;
                 let jwk = if kid == "1" {
-                    Some(auth.rsa_public_jwk.clone())
+                    Some(auth.public_jwk.clone())
                 } else {
                     None
                 };

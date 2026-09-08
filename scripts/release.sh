@@ -11,14 +11,25 @@ mkdir -p "$ANSIBLE_LOCAL_TEMP"
 export ANSIBLE_LOCAL_TEMP
 
 run_quietly() {
-  local label="$1" log="$2"
+  local label="$1" log_name="$2" log
   shift 2
+  case "$log_name" in
+    tests|bootstrap|docker-build|image-transfer|deploy)
+      ;;
+    *)
+      echo "unrecognized release log name: $log_name" >&2
+      exit 2
+      ;;
+  esac
+  log="$LOG_DIR/$log_name.log"
   printf '%-18s' "$label"
   if "$@" >"$log" 2>&1; then
     echo "ok"
   else
     local status=$?
     echo "FAILED"
+    # log_name is restricted to the fixed names above and resolved below LOG_DIR.
+    # foxguard: ignore[bash/taint-path-traversal]
     tail -n 80 "$log" >&2
     exit "$status"
   fi
@@ -72,20 +83,23 @@ if head -n 1 "$ANSIBLE_DIR/group_vars/mcp/secrets.yml" | grep -q '^\$ANSIBLE_VAU
   fi
 fi
 
-PUBLIC_URL="${APRENDIENDO_URL:-}"
-if [[ -z "$PUBLIC_URL" ]]; then
-  domain="$(awk '$1 == "mcp_domain:" { print $2; exit }' "$ANSIBLE_DIR/group_vars/mcp/main.yml")"
-  domain="${domain%\"}"
-  domain="${domain#\"}"
-  domain="${domain%\'}"
-  domain="${domain#\'}"
-  [[ -n "$domain" ]] || {
-    echo "cannot determine mcp_domain; set APRENDIENDO_URL" >&2
-    exit 2
-  }
-  PUBLIC_URL="https://$domain"
+domain="$(awk '$1 == "mcp_domain:" { print $2; exit }' "$ANSIBLE_DIR/group_vars/mcp/main.yml")"
+domain="${domain%\"}"
+domain="${domain#\"}"
+domain="${domain%\'}"
+domain="${domain#\'}"
+if [[ -z "$domain" || ! "$domain" =~ ^[A-Za-z0-9.-]+$ ]]; then
+  echo "cannot determine a valid mcp_domain from deploy configuration" >&2
+  exit 2
 fi
+configured_public_url="https://$domain"
+PUBLIC_URL="${APRENDIENDO_URL:-}"
 PUBLIC_URL="${PUBLIC_URL%/}"
+if [[ -n "$PUBLIC_URL" && "$PUBLIC_URL" != "$configured_public_url" ]]; then
+  echo "APRENDIENDO_URL must match the configured HTTPS deployment origin: $configured_public_url" >&2
+  exit 2
+fi
+PUBLIC_URL="$configured_public_url"
 
 read_main_var() {
   local key="$1" value
@@ -97,10 +111,29 @@ read_main_var() {
   printf '%s' "$value"
 }
 
-AUTH_MODE="${APRENDIENDO_AUTH_MODE:-$(read_main_var mcp_auth_mode)}"
-OIDC_ISSUER="${APRENDIENDO_OIDC_ISSUER:-$(read_main_var mcp_oidc_issuer)}"
-OIDC_REQUIRED_SCOPE="${APRENDIENDO_OIDC_REQUIRED_SCOPE:-$(read_main_var mcp_oidc_required_scope)}"
-OIDC_JWKS_URL="${APRENDIENDO_OIDC_JWKS_URL:-$(read_main_var mcp_oidc_jwks_url)}"
+AUTH_MODE="$(read_main_var mcp_auth_mode)"
+configured_oidc_issuer="$(read_main_var mcp_oidc_issuer)"
+configured_oidc_required_scope="$(read_main_var mcp_oidc_required_scope)"
+configured_oidc_jwks_url="$(read_main_var mcp_oidc_jwks_url)"
+if [[ -n "${APRENDIENDO_AUTH_MODE:-}" && "$APRENDIENDO_AUTH_MODE" != "$AUTH_MODE" ]]; then
+  echo "APRENDIENDO_AUTH_MODE must match the deploy configuration" >&2
+  exit 2
+fi
+if [[ -n "${APRENDIENDO_OIDC_ISSUER:-}" && "$APRENDIENDO_OIDC_ISSUER" != "$configured_oidc_issuer" ]]; then
+  echo "APRENDIENDO_OIDC_ISSUER must match the deploy configuration" >&2
+  exit 2
+fi
+if [[ -n "${APRENDIENDO_OIDC_REQUIRED_SCOPE:-}" && "$APRENDIENDO_OIDC_REQUIRED_SCOPE" != "$configured_oidc_required_scope" ]]; then
+  echo "APRENDIENDO_OIDC_REQUIRED_SCOPE must match the deploy configuration" >&2
+  exit 2
+fi
+if [[ -n "${APRENDIENDO_OIDC_JWKS_URL:-}" && "$APRENDIENDO_OIDC_JWKS_URL" != "$configured_oidc_jwks_url" ]]; then
+  echo "APRENDIENDO_OIDC_JWKS_URL must match the deploy configuration" >&2
+  exit 2
+fi
+OIDC_ISSUER="$configured_oidc_issuer"
+OIDC_REQUIRED_SCOPE="$configured_oidc_required_scope"
+OIDC_JWKS_URL="$configured_oidc_jwks_url"
 
 [[ -n "$AUTH_MODE" ]] || {
   echo "cannot determine mcp_auth_mode; set APRENDIENDO_AUTH_MODE" >&2
@@ -148,7 +181,7 @@ PY
 fi
 
 echo "Aprendiendo release -> $PUBLIC_URL"
-run_quietly "tests" "$LOG_DIR/tests.log" \
+run_quietly "tests" tests \
   cargo test --manifest-path "$ROOT/Cargo.toml" --locked --quiet
 
 SSH_HOST="${APRENDIENDO_SSH_HOST:-$(awk '$1 == "ansible_host:" { print $2; exit }' "$ANSIBLE_DIR/inventory/hosts.yml")}"
@@ -170,10 +203,10 @@ IMAGE_TAG="${APRENDIENDO_IMAGE_TAG:-release-$(date -u +%Y%m%d%H%M%S)}"
 IMAGE_REF="$IMAGE_NAME:$IMAGE_TAG"
 DOCKER_PLATFORM="${APRENDIENDO_DOCKER_PLATFORM:-linux/amd64}"
 
-run_quietly "bootstrap" "$LOG_DIR/bootstrap.log" \
+run_quietly "bootstrap" bootstrap \
   bash -c 'cd "$1" && shift && exec "$@"' _ "$ANSIBLE_DIR" \
   "${ANSIBLE[@]}" site.yml --tags bootstrap "${VAULT_ARGS[@]}"
-run_quietly "docker build" "$LOG_DIR/docker-build.log" \
+run_quietly "docker build" docker-build \
   docker build --platform "$DOCKER_PLATFORM" --tag "$IMAGE_REF" "$ROOT"
 
 stream_image() {
@@ -183,21 +216,34 @@ stream_image() {
     | ssh "${SSH_ARGS[@]}" "$SSH_DEST" 'gzip -d | sudo -n docker load'
 }
 
-run_quietly "image transfer" "$LOG_DIR/image-transfer.log" \
+run_quietly "image transfer" image-transfer \
   stream_image "$IMAGE_REF"
-run_quietly "deploy" "$LOG_DIR/deploy.log" \
+run_quietly "deploy" deploy \
   bash -c 'cd "$1" && shift && exec "$@"' _ "$ANSIBLE_DIR" \
   "${ANSIBLE[@]}" site.yml --extra-vars "mcp_image=$IMAGE_REF" \
   "${PRACTICE_VARS_ARGS[@]}" "${VAULT_ARGS[@]}"
 
 curl_json() {
+  local target="$1" output="$2" url
+  case "$target" in
+    health) url="$PUBLIC_URL/health" ;;
+    ready) url="$PUBLIC_URL/ready" ;;
+    resource) url="$PUBLIC_URL/.well-known/oauth-protected-resource" ;;
+    oidc-discovery) url="${OIDC_ISSUER%/}/.well-known/openid-configuration" ;;
+    oauth) url="$PUBLIC_URL/.well-known/oauth-authorization-server" ;;
+    *) echo "unrecognized release URL target: $target" >&2; exit 2 ;;
+  esac
+  # url is selected only from the validated deployment/OIDC origins and fixed paths above.
+  # foxguard: ignore[bash/taint-ssrf]
   curl --fail --silent --show-error \
     --retry 8 --retry-delay 2 --retry-all-errors --max-time 15 \
-    "$1" -o "$2"
+    "$url" -o "$output"
 }
 
 check_mcp_challenge() {
   local headers="$1" body="$2" status
+  # PUBLIC_URL is the validated deployment origin derived from inventory above.
+  # foxguard: ignore[bash/taint-ssrf]
   status="$(curl --silent --show-error --max-time 15 \
     -D "$headers" -o "$body" -w '%{http_code}' \
     -X POST "$PUBLIC_URL/mcp" \
@@ -222,20 +268,20 @@ PY
 }
 
 if [[ "$AUTH_MODE" == "oidc" ]]; then
-  curl_json "${OIDC_ISSUER%/}/.well-known/openid-configuration" "$LOG_DIR/oidc-discovery.json"
+  curl_json oidc-discovery "$LOG_DIR/oidc-discovery.json"
   local_auth_status="$(curl --silent --show-error --max-time 15 -o /dev/null -w '%{http_code}' "$PUBLIC_URL/.well-known/oauth-authorization-server")"
   [[ "$local_auth_status" == "404" ]] || {
     echo "OIDC mode must not expose local authorization-server metadata (got $local_auth_status)" >&2
     exit 1
   }
 elif [[ "$AUTH_MODE" == "embedded_oauth" ]]; then
-  curl_json "$PUBLIC_URL/.well-known/oauth-authorization-server" "$LOG_DIR/oauth.json"
+  curl_json oauth "$LOG_DIR/oauth.json"
 fi
 
 printf '%-18s' "sanity check"
-if curl_json "$PUBLIC_URL/health" "$LOG_DIR/health.json" \
-  && curl_json "$PUBLIC_URL/ready" "$LOG_DIR/ready.json" \
-  && curl_json "$PUBLIC_URL/.well-known/oauth-protected-resource" "$LOG_DIR/resource.json" \
+if curl_json health "$LOG_DIR/health.json" \
+  && curl_json ready "$LOG_DIR/ready.json" \
+  && curl_json resource "$LOG_DIR/resource.json" \
   && check_mcp_challenge "$LOG_DIR/challenge.headers" "$LOG_DIR/challenge.body" \
   && python3 - "$PUBLIC_URL" "$LOG_DIR" "$AUTH_MODE" "$OIDC_ISSUER" "$OIDC_JWKS_URL" "$OIDC_REQUIRED_SCOPE" <<'PY'
 import json

@@ -204,7 +204,8 @@ authorization headers; ChatGPT production authentication uses Pocket ID.
 
 `AUTH_MODE=embedded_oauth` remains available only as a rollback path during the
 observation window. Its password hash and signing key are deliberately kept out
-of the active OIDC environment.
+of the active OIDC environment. The embedded issuer uses an Ed25519 PKCS#8 key
+at `OAUTH_ED25519_KEY_PATH` and publishes an EdDSA JWKS entry.
 
 `AUTH_MODE=disabled` is rejected on non-loopback listeners unless `ALLOW_INSECURE_NO_AUTH=true`. That escape hatch is only for local development; do not use it on a public endpoint.
 

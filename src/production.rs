@@ -117,7 +117,29 @@ pub struct SessionOverride {
 pub const DDL: &str = "CREATE TABLE IF NOT EXISTS practice_preferences (id INTEGER PRIMARY KEY CHECK(id=1),version INTEGER NOT NULL,preferences_json TEXT NOT NULL,updated_at TEXT NOT NULL,source TEXT NOT NULL); CREATE TABLE IF NOT EXISTS production_sessions(session_id INTEGER PRIMARY KEY REFERENCES sessions(id), policy_json TEXT NOT NULL, evidence_json TEXT NOT NULL, audit_json TEXT NOT NULL); CREATE TABLE IF NOT EXISTS unobserved_targets(session_id INTEGER NOT NULL REFERENCES sessions(id),observation_no INTEGER NOT NULL,PRIMARY KEY(session_id,observation_no));";
 
 pub fn defaults() -> Preferences {
-    serde_json::from_value(json!({"default_practice_mode":"mixed","excluded_drill_types":[],"prompt_policy":{"allow_required_constructions":true,"allow_sentence_starters":true,"allow_model_answer_before_attempt":true,"prefer_actual_recent_experiences":false,"one_turn_at_a_time":true,"adaptive_followups":true},"written_round_budget":{"minimum":3,"maximum":5},"correction_policy":{"after_round":true,"allow_communication_breakdown_exception":true,"self_correction_attempts_before_model":1,"quote_original_on_hint":true,"show_original_with_model_correction":true}})).unwrap()
+    Preferences {
+        default_practice_mode: PracticeMode::Mixed,
+        excluded_drill_types: Vec::new(),
+        prompt_policy: PromptPolicy {
+            allow_required_constructions: true,
+            allow_sentence_starters: true,
+            allow_model_answer_before_attempt: true,
+            prefer_actual_recent_experiences: false,
+            one_turn_at_a_time: true,
+            adaptive_followups: true,
+        },
+        written_round_budget: WrittenRoundBudget {
+            minimum: 3,
+            maximum: 5,
+        },
+        correction_policy: CorrectionPolicy {
+            after_round: true,
+            allow_communication_breakdown_exception: true,
+            self_correction_attempts_before_model: 1,
+            quote_original_on_hint: true,
+            show_original_with_model_correction: true,
+        },
+    }
 }
 pub fn approved() -> Preferences {
     let mut p = defaults();
@@ -247,7 +269,9 @@ pub fn constrain(c: &Connection, r: &mut PracticeBriefRequest) -> Result<Value> 
                         | DrillType::Retell
                 ))
     };
-    let conflicts = resolved["conflicts"].as_array_mut().unwrap();
+    let Some(conflicts) = resolved.get_mut("conflicts").and_then(Value::as_array_mut) else {
+        bail!("resolved practice policy is missing conflicts")
+    };
     if r.allowed_drill_types
         .as_ref()
         .is_some_and(|ds| ds.iter().any(|d| !permitted(d)))
@@ -733,16 +757,28 @@ fn attempt_class(
     e: &ProductionEvidence,
     a: &AttemptEvidence,
 ) -> (&'static str, Vec<Value>) {
-    let attempt = r
-        .attempts
-        .iter()
-        .find(|x| x.attempt_no == a.attempt_no)
-        .unwrap();
-    let item = r
+    let Some(attempt) = r.attempts.iter().find(|x| x.attempt_no == a.attempt_no) else {
+        return (
+            "unknown",
+            vec![json!({
+                "code": "invalid_attempt_reference",
+                "attempt_no": a.attempt_no
+            })],
+        );
+    };
+    let Some(item) = r
         .items
         .iter()
         .find(|x| Some(x.item_no) == attempt.practice_item_no)
-        .unwrap();
+    else {
+        return (
+            "unknown",
+            vec![json!({
+                "code": "invalid_practice_item_reference",
+                "attempt_no": a.attempt_no
+            })],
+        );
+    };
     let targets = item
         .target_weakness_keys
         .iter()
@@ -820,16 +856,15 @@ pub fn review_decision(
         obs.iter()
             .any(|v| v.observation_no == o.observation_no && v.weakness_key == review.weakness_key)
     }) {
-        let a = e
-            .attempts
-            .iter()
-            .find(|a| a.attempt_no == o.attempt_no)
-            .unwrap();
+        let Some(a) = e.attempts.iter().find(|a| a.attempt_no == o.attempt_no) else {
+            d.reason_codes.push("invalid_attempt_reference".into());
+            continue;
+        };
         let (class, findings) = attempt_class(r, e, a);
-        let actual = obs
-            .iter()
-            .find(|v| v.observation_no == o.observation_no)
-            .unwrap();
+        let Some(actual) = obs.iter().find(|v| v.observation_no == o.observation_no) else {
+            d.reason_codes.push("invalid_observation_reference".into());
+            continue;
+        };
         let reason = if matches!(
             o.target_realization,
             TargetRealization::NotObserved | TargetRealization::Ambiguous
@@ -958,7 +993,7 @@ pub fn audit(
         let (class, findings) = attempt_class(r, e, a);
         let initial = a.attempt_kind == AttemptKind::Initial;
         if initial {
-            *counts.get_mut(class).unwrap() += 1;
+            *counts.entry(class).or_insert(0) += 1;
             sentences += u32::from(a.initial_sentence_count.unwrap_or(0));
         }
         if policy["effective_preferences"]["default_practice_mode"] == "spontaneous"
@@ -967,16 +1002,24 @@ pub fn audit(
         {
             violations.extend(findings);
         }
-        let attempt = r
-            .attempts
-            .iter()
-            .find(|v| v.attempt_no == a.attempt_no)
-            .unwrap();
-        let item = r
+        let Some(attempt) = r.attempts.iter().find(|v| v.attempt_no == a.attempt_no) else {
+            violations.push(json!({
+                "code": "invalid_attempt_reference",
+                "attempt_no": a.attempt_no
+            }));
+            continue;
+        };
+        let Some(item) = r
             .items
             .iter()
             .find(|i| Some(i.item_no) == attempt.practice_item_no)
-            .unwrap();
+        else {
+            violations.push(json!({
+                "code": "invalid_practice_item_reference",
+                "attempt_no": a.attempt_no
+            }));
+            continue;
+        };
         if initial
             && policy["effective_preferences"]["excluded_drill_types"]
                 .as_array()

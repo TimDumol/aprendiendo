@@ -84,7 +84,9 @@ impl LearningServer {
             // Publish concrete input shapes at the source, not generated client files.
             let schema = serde_json::Value::Object((*route.attr.input_schema).clone());
             let expanded = inline_input_schema(&schema, &schema, 0);
-            route.attr.input_schema = std::sync::Arc::new(expanded.as_object().unwrap().clone());
+            if let Some(expanded_object) = expanded.as_object() {
+                route.attr.input_schema = std::sync::Arc::new(expanded_object.clone());
+            }
         }
         Self { store, tool_router }
     }

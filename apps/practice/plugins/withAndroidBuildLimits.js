@@ -31,7 +31,11 @@ function withAndroidBuildLimits(config) {
   const heap = memoryValue('PRACTICE_GRADLE_HEAP', '2048m');
   const metaspace = memoryValue('PRACTICE_GRADLE_METASPACE', '1024m');
   const architectures = process.env.PRACTICE_ANDROID_ARCHITECTURES || 'arm64-v8a';
-  if (!/^[a-z0-9-]+(,[a-z0-9-]+)*$/.test(architectures)) {
+  const architectureList = architectures.split(',');
+  if (
+    architectureList.length === 0 ||
+    architectureList.some((architecture) => !/^[a-z0-9-]+$/.test(architecture))
+  ) {
     throw new Error('PRACTICE_ANDROID_ARCHITECTURES must be a comma-separated ABI list.');
   }
 

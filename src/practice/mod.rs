@@ -655,12 +655,7 @@ async fn create_upload(
     })?;
     validate_upload_request(&input)?;
     let payload_hash = hash_json(&input)?;
-    let staging_path = state
-        .config
-        .media_dir
-        .join("staging")
-        .join(format!("{}.upload", Uuid::new_v4()));
-    let staging_path_text = staging_path.to_string_lossy().into_owned();
+    let staging_path_text = format!("staging/{}.upload", Uuid::new_v4());
     let upload = state
         .store
         .create_upload(&input, &payload_hash, &staging_path_text)?;
@@ -710,7 +705,9 @@ async fn upload_content(
             "the content MIME type does not match the upload declaration",
         ));
     }
-    fs::write(&upload.staging_path, &body)
+    let staging = safe_media_path(&state.config.media_dir, &upload.staging_path)
+        .map_err(PracticeError::from_anyhow)?;
+    fs::write(staging, &body)
         .map_err(|error| PracticeError::internal(format!("write upload: {error}")))?;
     state.store.mark_upload_written(&upload.id)?;
     Ok(Json(
@@ -734,7 +731,8 @@ async fn finalize_upload(
             "expires_at": recording.expires_at,
         })));
     }
-    let staging = PathBuf::from(&upload.staging_path);
+    let staging = safe_media_path(&state.config.media_dir, &upload.staging_path)
+        .map_err(PracticeError::from_anyhow)?;
     let bytes = fs::read(&staging)
         .map_err(|_| PracticeError::invalid("upload content has not been provided"))?;
     if bytes.len() as u64 != upload.expected_bytes {
@@ -1167,15 +1165,21 @@ fn extension_for_mime(value: &str) -> &'static str {
 }
 
 fn safe_media_path(media_dir: &Path, relative_path: &str) -> Result<PathBuf> {
-    let path = Path::new(relative_path);
-    if path.is_absolute()
-        || path
-            .components()
-            .any(|component| matches!(component, std::path::Component::ParentDir))
+    if relative_path.is_empty()
+        || relative_path.starts_with('/')
+        || relative_path.contains('\\')
+        || relative_path
+            .split('/')
+            .any(|component| component.is_empty() || component == "." || component == "..")
+        || relative_path.split('/').any(|component| {
+            !component
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        })
     {
         bail!("invalid managed media path")
     }
-    Ok(media_dir.join(path))
+    Ok(media_dir.join(relative_path))
 }
 
 fn hash_json<T: Serialize>(value: &T) -> Result<String, PracticeError> {

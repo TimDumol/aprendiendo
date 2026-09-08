@@ -977,8 +977,11 @@ fn session_measured_duration(c: &Connection, sid: i64) -> Result<Option<i64>> {
             return Ok(None);
         }
         for (value, _) in values {
+            let Some(value) = value else {
+                return Ok(None);
+            };
             total = total
-                .checked_add(value.expect("checked above"))
+                .checked_add(value)
                 .ok_or_else(|| anyhow!("measured duration overflow"))?;
         }
     }
@@ -2044,7 +2047,10 @@ impl LearningStore for SqliteStore {
     async fn practice_brief(&self, mut request: PracticeBriefRequest) -> Result<Value> {
         let c = self.conn()?;
         let policy = crate::production::constrain(&c, &mut request)?;
-        if !policy["conflicts"].as_array().unwrap().is_empty()
+        if policy
+            .get("conflicts")
+            .and_then(Value::as_array)
+            .is_some_and(|conflicts| !conflicts.is_empty())
             || request
                 .allowed_drill_types
                 .as_ref()
@@ -2052,7 +2058,11 @@ impl LearningStore for SqliteStore {
         {
             let mut out = policy;
             out["status"] = json!("no_compatible_activity");
-            if out["conflicts"].as_array().unwrap().is_empty() {
+            if out
+                .get("conflicts")
+                .and_then(Value::as_array)
+                .is_none_or(Vec::is_empty)
+            {
                 out["conflicts"] = json!([
                     "No permitted initial format remains; choose an open format or supply a sourced session override."
                 ]);
@@ -2288,7 +2298,10 @@ impl LearningStore for SqliteStore {
             ],
         });
         if let Some(activity_type) = activity {
-            let config_value = serde_json::to_value(merged_activity_config.as_ref().unwrap())?;
+            let Some(merged_config) = merged_activity_config.as_ref() else {
+                bail!("activity configuration is missing")
+            };
+            let config_value = serde_json::to_value(merged_config)?;
             let complication_count = merged_activity_config
                 .as_ref()
                 .and_then(|value| value.complication_count)
@@ -2298,10 +2311,12 @@ impl LearningStore for SqliteStore {
             let mut cursor = 0usize;
             let mut allocations_json = Vec::with_capacity(total);
             for item_no in 1..=total {
-                let target_index = (0..target_count)
+                let Some(target_index) = (0..target_count)
                     .map(|offset| (cursor + offset) % target_count)
                     .find(|index| occurrences[*index] < allocations[*index])
-                    .expect("round-robin allocation must cover every item");
+                else {
+                    bail!("round-robin allocation could not cover every item")
+                };
                 let occurrence = occurrences[target_index];
                 occurrences[target_index] += 1;
                 cursor = (target_index + 1) % target_count;
@@ -2310,7 +2325,9 @@ impl LearningStore for SqliteStore {
                         eligible[target_index]
                             .iter()
                             .find(|value| value.stage == "recognition")
-                            .expect("validated recognition recommendation")
+                            .ok_or_else(|| {
+                                anyhow!("validated recognition recommendation is missing")
+                            })?
                     } else {
                         eligible[target_index]
                             .iter()
@@ -2320,10 +2337,15 @@ impl LearningStore for SqliteStore {
                                     "controlled" | "transfer" | "fluency"
                                 )
                             })
-                            .expect("validated production recommendation")
+                            .ok_or_else(|| {
+                                anyhow!("validated production recommendation is missing")
+                            })?
                     }
                 } else {
-                    &eligible[target_index][0]
+                    eligible
+                        .get(target_index)
+                        .and_then(|recommendations| recommendations.first())
+                        .ok_or_else(|| anyhow!("validated drill recommendation is missing"))?
                 };
                 let phase = activities::phase_for_item(
                     activity_type,
@@ -2373,7 +2395,10 @@ impl LearningStore for SqliteStore {
                 ),
             ]);
         }
-        for (key, value) in policy.as_object().unwrap() {
+        let Some(policy_object) = policy.as_object() else {
+            bail!("resolved practice policy is not an object")
+        };
+        for (key, value) in policy_object {
             response[key] = value.clone();
         }
         if spontaneous {
@@ -2382,11 +2407,15 @@ impl LearningStore for SqliteStore {
             let mut private_targets = response["targets"].take();
             if let Some(targets) = private_targets.as_array_mut() {
                 for target in targets {
-                    target.as_object_mut().unwrap().remove("allocation");
+                    if let Some(target_object) = target.as_object_mut() {
+                        target_object.remove("allocation");
+                    }
                 }
             }
             response["tutor_context"] = json!({"targets":private_targets});
-            response.as_object_mut().unwrap().remove("targets");
+            if let Some(response_object) = response.as_object_mut() {
+                response_object.remove("targets");
+            }
             response["learner_task_constraints"] = json!({"initial_output_budget":response["effective_preferences"]["written_round_budget"],"unit":"sentences","scope":"initial_responses","one_turn_at_a_time":true,"followup_strategy":"Adapt to the actual response and remaining budget; accept valid alternative wording."});
             response["generation_rules"] = json!([
                 format!(
@@ -2400,10 +2429,13 @@ impl LearningStore for SqliteStore {
                 "Do not add drills to obtain a rating. Rules cannot prove spontaneity or oral fluency."
             ]);
             if let Some(plan) = response.get_mut("activity_plan") {
-                plan.as_object_mut().unwrap().remove("item_allocations");
-                plan["followup_strategy"] = json!(
-                    "Respond to the learner's actual message with a relevant question or plausible complication; stop within the initial output budget."
-                );
+                if let Some(plan_object) = plan.as_object_mut() {
+                    plan_object.remove("item_allocations");
+                    plan_object.insert(
+                        "followup_strategy".to_owned(),
+                        json!("Respond to the learner's actual message with a relevant question or plausible complication; stop within the initial output budget."),
+                    );
+                }
             }
         }
         Ok(response)

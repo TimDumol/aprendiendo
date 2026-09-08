@@ -191,10 +191,12 @@ async fn log_http(mut request: Request<Body>, next: Next) -> Response {
     let mut response = next.run(request).await;
     let status = response.status();
     let elapsed_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
-    response.headers_mut().insert(
-        header::HeaderName::from_static("x-request-id"),
-        HeaderValue::from_str(&request_id).expect("generated request IDs are valid headers"),
-    );
+    if let Ok(request_id_header) = HeaderValue::from_str(&request_id) {
+        response.headers_mut().insert(
+            header::HeaderName::from_static("x-request-id"),
+            request_id_header,
+        );
+    }
 
     if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
         warn!(

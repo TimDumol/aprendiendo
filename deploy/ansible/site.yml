@@ -164,9 +164,37 @@
           OIDC_AUDIENCE={{ mcp_oidc_audience }}
           OIDC_ALLOWED_SUBJECT={{ mcp_oidc_allowed_subject }}
           OIDC_REQUIRED_SCOPE={{ mcp_oidc_required_scope }}
+          {% if mcp_auth_mode == 'embedded_oauth' %}
+          OAUTH_USERNAME={{ mcp_oauth_username }}
+          OAUTH_PASSWORD_HASH={{ mcp_oauth_password_hash }}
+          OAUTH_ED25519_KEY_PATH=/run/secrets/oauth-signing-key-ed25519.pem
+          # Legacy pre-EdDSA images use this path during rollback only.
+          OAUTH_RSA_KEY_PATH=/run/secrets/oauth-signing-key.pem
+          OAUTH_CLIENT_ID={{ mcp_oauth_client_id }}
+          OAUTH_REDIRECT_URI={{ mcp_oauth_redirect_uri }}
+          {% endif %}
       no_log: true
 
-    - name: Preserve the embedded OAuth signing key for the rollback window
+    - name: Provision an Ed25519 OAuth signing key for the rollback window
+      ansible.builtin.command:
+        argv:
+          - openssl
+          - genpkey
+          - -algorithm
+          - ED25519
+          - -out
+          - "{{ mcp_deploy_dir }}/secrets/oauth-signing-key-ed25519.pem"
+        creates: "{{ mcp_deploy_dir }}/secrets/oauth-signing-key-ed25519.pem"
+
+    - name: Protect the Ed25519 OAuth signing key
+      ansible.builtin.file:
+        path: "{{ mcp_deploy_dir }}/secrets/oauth-signing-key-ed25519.pem"
+        # The application image runs as this fixed, non-root numeric account.
+        owner: '65532'
+        group: '65532'
+        mode: '0400'
+
+    - name: Preserve the legacy RSA OAuth key for pre-EdDSA rollback images
       ansible.builtin.command:
         argv:
           - openssl
@@ -179,7 +207,7 @@
           - "{{ mcp_deploy_dir }}/secrets/oauth-signing-key.pem"
         creates: "{{ mcp_deploy_dir }}/secrets/oauth-signing-key.pem"
 
-    - name: Protect OAuth signing key
+    - name: Protect the legacy RSA OAuth signing key
       ansible.builtin.file:
         path: "{{ mcp_deploy_dir }}/secrets/oauth-signing-key.pem"
         # The application image runs as this fixed, non-root numeric account.
@@ -204,6 +232,8 @@
               tmpfs:
                 - /tmp:size=8m,mode=1777
               volumes:
+                - {{ mcp_deploy_dir }}/secrets/oauth-signing-key-ed25519.pem:/run/secrets/oauth-signing-key-ed25519.pem:ro
+                # Kept only so a pre-EdDSA release can still be rolled back safely.
                 - {{ mcp_deploy_dir }}/secrets/oauth-signing-key.pem:/run/secrets/oauth-signing-key.pem:ro
                 - {{ mcp_deploy_dir }}/app/data:/data
               mem_limit: 96m

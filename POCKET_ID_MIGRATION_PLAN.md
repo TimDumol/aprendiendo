@@ -62,9 +62,10 @@ do not mix the two identifiers.
 
 - [ ] Snapshot the production Aprendiendo SQLite database and record its
   integrity result. Do not alter learning rows during this migration.
-- [ ] Preserve the existing embedded OAuth password hash and RSA signing key
-  until the Pocket ID cutover has passed acceptance testing. They are the
-  rollback path.
+- [ ] Preserve the existing embedded OAuth password hash and signing keys until
+  the Pocket ID cutover has passed acceptance testing. The new embedded issuer
+  uses Ed25519/EdDSA; retain the old RSA key only for restoring a pre-EdDSA
+  release during the rollback window.
 - [ ] Fetch Pocket ID's public OIDC discovery document without logging tokens
   or credentials. Verify:
   - `issuer` is exactly `https://auth.aries.timdumol.com`;
@@ -206,11 +207,11 @@ Only after a successful production observation period:
 
 - [ ] Remove `AUTH_MODE=embedded_oauth` from deployment documentation and
   production configuration paths.
-- [ ] Remove embedded OAuth password and RSA-key generation/mount tasks from
+- [ ] Remove embedded OAuth password and signing-key generation/mount tasks from
   Ansible, after taking an encrypted archival copy if the rollback policy
   requires it.
 - [ ] Remove `src/embedded_oauth.rs`, its routes, and dependencies used only by
-  the embedded provider (`argon2`, RSA signing, cookie/login support), unless
+  the embedded provider (`argon2`, EdDSA signing, cookie/login support), unless
   another supported client still needs that mode.
 - [ ] Delete or update embedded-only integration tests and release checks.
 - [ ] Keep the resource-server OIDC tests and the manual Pocket ID acceptance
@@ -224,7 +225,8 @@ Only after a successful production observation period:
 If Pocket ID discovery, token claims, or ChatGPT refresh fails:
 
 1. Restore the previous Aprendiendo release/configuration.
-2. Verify the original embedded RSA key and password hash are still present.
+2. Verify the embedded Ed25519 key and password hash are still present. If
+   restoring a pre-EdDSA release, verify its legacy RSA key is still present.
 3. Run `scripts/release.sh` and confirm the old health and OAuth checks pass.
 4. Diagnose the failed Pocket ID path using redacted discovery/token metadata;
    do not copy tokens into issue reports or logs.

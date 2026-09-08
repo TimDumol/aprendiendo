@@ -10,9 +10,7 @@ use axum::{
     middleware,
     routing::{get, post},
 };
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
-use rsa::{RsaPrivateKey, pkcs8::EncodePrivateKey, traits::PublicKeyParts};
+use jsonwebtoken::{Algorithm, EncodingKey, Header, encode, jwk::Jwk};
 use serde_json::{Value, json};
 use tokio::task::JoinHandle;
 
@@ -21,6 +19,11 @@ const RESOURCE: &str = "https://mars.example.test";
 const SUBJECT: &str = "learner-subject";
 const SCOPE: &str = "learning:access";
 const KID: &str = "test-signing-key";
+const ED25519_PRIVATE_KEY_DER: &[u8] = &[
+    0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20,
+    0x6a, 0xc3, 0xfd, 0xee, 0xee, 0x29, 0x8a, 0x92, 0x63, 0x8b, 0x70, 0x0c, 0x4b, 0x11, 0x7c, 0xc3,
+    0x2e, 0x2d, 0x2a, 0xce, 0x0d, 0xfd, 0x78, 0x76, 0x94, 0xe2, 0x4c, 0xae, 0x8a, 0xd5, 0x82, 0x34,
+];
 
 struct TestOidcApp {
     base_url: String,
@@ -38,19 +41,12 @@ impl Drop for TestOidcApp {
 }
 
 async fn setup() -> TestOidcApp {
-    let private_key =
-        RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).expect("test RSA key should generate");
-    let public_key = private_key.to_public_key();
-    let jwks = Json(json!({
-        "keys": [{
-            "kty": "RSA",
-            "n": URL_SAFE_NO_PAD.encode(public_key.n().to_bytes_be()),
-            "e": URL_SAFE_NO_PAD.encode(public_key.e().to_bytes_be()),
-            "kid": KID,
-            "alg": "RS256",
-            "use": "sig"
-        }]
-    }));
+    let signing_key = EncodingKey::from_ed_der(ED25519_PRIVATE_KEY_DER);
+    let mut jwk = Jwk::from_encoding_key(&signing_key, Algorithm::EdDSA)
+        .expect("test Ed25519 key should produce a JWK");
+    jwk.common.key_id = Some(KID.to_string());
+    jwk.common.public_key_use = Some(jsonwebtoken::jwk::PublicKeyUse::Signature);
+    let jwks = Json(json!({"keys": [jwk]}));
 
     let jwks_app = Router::new().route("/jwks", get(move || async move { jwks }));
     let jwks_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -83,14 +79,10 @@ async fn setup() -> TestOidcApp {
         axum::serve(listener, app).await.unwrap();
     });
 
-    let pem = private_key
-        .to_pkcs8_pem(rsa::pkcs8::LineEnding::LF)
-        .expect("test key should encode");
-
     TestOidcApp {
         base_url,
         auth,
-        signing_key: EncodingKey::from_rsa_pem(pem.as_bytes()).unwrap(),
+        signing_key,
         jwks_task,
         app_task,
     }
@@ -103,8 +95,8 @@ fn now() -> u64 {
         .as_secs()
 }
 
-fn rsa_token(key: &EncodingKey, kid: &str, claims: Value) -> String {
-    let mut header = Header::new(Algorithm::RS256);
+fn eddsa_token(key: &EncodingKey, kid: &str, claims: Value) -> String {
+    let mut header = Header::new(Algorithm::EdDSA);
     header.kid = Some(kid.to_string());
     encode(&header, &claims, key).expect("test token should encode")
 }
@@ -154,13 +146,13 @@ async fn oidc_metadata_and_missing_token_challenge_are_pocket_id_ready() {
 #[tokio::test]
 async fn oidc_accepts_a_valid_access_token_and_scope_variants() {
     let app = setup().await;
-    let token = rsa_token(&app.signing_key, KID, valid_claims());
+    let token = eddsa_token(&app.signing_key, KID, valid_claims());
     assert_eq!(request(&app, Some(&token)).await.status(), StatusCode::OK);
 
     let mut claims = valid_claims();
     claims["scope"] = Value::Null;
     claims["scp"] = json!([SCOPE]);
-    let token = rsa_token(&app.signing_key, KID, claims);
+    let token = eddsa_token(&app.signing_key, KID, claims);
     assert_eq!(request(&app, Some(&token)).await.status(), StatusCode::OK);
 }
 
@@ -185,7 +177,7 @@ async fn oidc_rejects_invalid_issuer_audience_algorithm_key_scope_subject_and_ex
         for (key, value) in override_claims.as_object().unwrap() {
             claims[key] = value.clone();
         }
-        let token = rsa_token(&app.signing_key, KID, claims);
+        let token = eddsa_token(&app.signing_key, KID, claims);
         assert_eq!(
             request(&app, Some(&token)).await.status(),
             StatusCode::UNAUTHORIZED,
@@ -206,7 +198,7 @@ async fn oidc_rejects_invalid_issuer_audience_algorithm_key_scope_subject_and_ex
         StatusCode::UNAUTHORIZED
     );
 
-    let unknown_key = rsa_token(&app.signing_key, "unknown-key", valid_claims());
+    let unknown_key = eddsa_token(&app.signing_key, "unknown-key", valid_claims());
     assert_eq!(
         request(&app, Some(&unknown_key)).await.status(),
         StatusCode::UNAUTHORIZED

@@ -6,11 +6,17 @@ import type {
 import { fileUriForArtifact } from "@/lib/media/recording";
 import { getAccessToken, PRACTICE_API_URL as AUTH_PRACTICE_API_URL } from "@/lib/auth";
 import { logWarn } from "@/lib/logging";
+import {
+  allowlistedApiPath,
+  allowlistedBrowserAssetUrl,
+  allowlistedHttpUrl,
+  configuredHttpOrigin,
+} from "@/lib/network";
 import { requestDurableFeedback } from "@/lib/sync/outbox";
 
-export const MVP_API_URL = (
-  process.env.EXPO_PUBLIC_MVP_API_URL ?? "http://127.0.0.1:8082"
-).replace(/\/+$/, "");
+export const MVP_API_URL = configuredHttpOrigin(
+  process.env.EXPO_PUBLIC_MVP_API_URL ?? "http://127.0.0.1:8082",
+);
 
 export const FEEDBACK_TIMEOUT_MS = 135_000;
 export const PRACTICE_API_URL = AUTH_PRACTICE_API_URL;
@@ -67,10 +73,12 @@ async function jsonOrError(response: Response): Promise<unknown> {
 }
 
 async function fetchWithTimeout(
-  input: RequestInfo | URL,
+  input: string,
   init: RequestInit,
   timeoutMs: number,
+  allowedOrigin: string,
 ): Promise<Response> {
+  const safeInput = allowlistedHttpUrl(input, [allowedOrigin], "Practice API request");
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   const externalSignal = init.signal;
@@ -78,7 +86,9 @@ async function fetchWithTimeout(
   externalSignal?.addEventListener("abort", abortExternal, { once: true });
 
   try {
-    return await fetch(input, { ...init, signal: controller.signal });
+    // Callers pass paths built from fixed API routes and an origin allowlist.
+    // foxguard: ignore[js/no-ssrf]
+    return await fetch(safeInput, { ...init, signal: controller.signal });
   } catch (error) {
     if (error instanceof Error && error.name === "AbortError") {
       throw new ApiError(
@@ -114,9 +124,10 @@ export async function getHealth(): Promise<HealthResponse> {
     );
   }
   const response = await fetchWithTimeout(
-    `${baseUrl}/health`,
+    allowlistedApiPath(baseUrl, "/health"),
     { method: "GET", headers: await authHeaders() },
     5_000,
+    new URL(baseUrl).origin,
   );
   const payload = await jsonOrError(response);
   if (!response.ok) {
@@ -163,9 +174,10 @@ export async function requestFeedback(
   form.append("task", task);
 
   const response = await fetchWithTimeout(
-    `${MVP_API_URL}/api/mvp/feedback`,
+    allowlistedApiPath(MVP_API_URL, "/api/mvp/feedback"),
     { method: "POST", body: form, headers: await authHeaders() },
     FEEDBACK_TIMEOUT_MS,
+    new URL(MVP_API_URL).origin,
   );
   const payload = await jsonOrError(response);
   if (!response.ok) {
@@ -207,7 +219,14 @@ export async function requestPhotoFeedback(
   form.append("duration_ms", String(Math.round(artifact.durationMs)));
   form.append("task", task);
   if (image.uri.startsWith("blob:") || image.uri.startsWith("http")) {
-    const imageBlob = await (await fetch(image.uri)).blob();
+    const imageUrl = allowlistedBrowserAssetUrl(image.uri);
+    // Browser object URLs and same-origin assets are never remote destinations.
+    // foxguard: ignore[js/no-ssrf]
+    const imageResponse = await fetch(imageUrl);
+    if (!imageResponse.ok) {
+      throw new ApiError("The selected image could not be read.", imageResponse.status, "image_unavailable");
+    }
+    const imageBlob = await imageResponse.blob();
     form.append("image", imageBlob, image.name ?? "practice-image.jpg");
   } else {
     form.append(
@@ -218,9 +237,10 @@ export async function requestPhotoFeedback(
   form.append("image_mime_type", image.mimeType);
 
   const response = await fetchWithTimeout(
-    `${MVP_API_URL}/api/mvp/feedback`,
+    allowlistedApiPath(MVP_API_URL, "/api/mvp/feedback"),
     { method: "POST", body: form, headers: await authHeaders() },
     FEEDBACK_TIMEOUT_MS,
+    new URL(MVP_API_URL).origin,
   );
   const payload = await jsonOrError(response);
   if (!response.ok) throw errorFromResponse(response, payload as ErrorPayload);

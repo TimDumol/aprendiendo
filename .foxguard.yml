@@ -1,0 +1,14 @@
+scan:
+  ignore_rules:
+    # Cargo rewrites generated lockfiles and drops inline comments. These are
+    # transitive TLS/JWT backend findings; application-issued embedded tokens
+    # use EdDSA, while upstream dependencies retain classical interoperability.
+    - path: Cargo.lock
+      rules:
+        - manifest/cargo-pq-vulnerable-dep
+    # package-lock.json is strict JSON, so the unavoidable build-time dependency
+    # cannot carry an inline FoxGuard comment. Expo's CLI pulls node-forge through
+    # @expo/code-signing-certificates; the app does not call node-forge directly.
+    - path: apps/practice/package-lock.json
+      rules:
+        - manifest/npm-pq-vulnerable-dep

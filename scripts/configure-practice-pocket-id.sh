@@ -26,6 +26,14 @@ done
 }
 
 POCKET_ID_URL="${POCKET_ID_URL%/}"
+if [[ "$POCKET_ID_URL" != "https://auth.aries.timdumol.com" ]]; then
+  printf 'PRACTICE_POCKET_ID_URL must be the trusted Pocket ID endpoint: https://auth.aries.timdumol.com\n' >&2
+  exit 2
+fi
+if [[ ! "$CLIENT_ID" =~ ^[A-Za-z0-9_-]{1,128}$ ]]; then
+  printf 'PRACTICE_OAUTH_CLIENT_ID contains unsupported characters.\n' >&2
+  exit 2
+fi
 umask 077
 api_config="$(mktemp /tmp/aprendiendo-pocket-id.XXXXXX)"
 api_response="$(mktemp /tmp/aprendiendo-pocket-id-response.XXXXXX.json)"
@@ -43,9 +51,36 @@ unset api_key_value
 
 api_request() {
   local method="$1" endpoint_path="$2" body_file="${3:-}" http_code
+  case "$endpoint_path" in
+    /api/apis\?pagination%5Bpage%5D=1\&pagination%5Blimit%5D=100|/api/apis)
+      ;;
+    /api/apis/*/permissions)
+      local endpoint_id="${endpoint_path#/api/apis/}"
+      endpoint_id="${endpoint_id%/permissions}"
+      [[ "$endpoint_id" =~ ^[A-Za-z0-9_-]{1,128}$ ]] || {
+        printf 'refusing an unrecognized Pocket ID API path: %s\n' "$endpoint_path" >&2
+        exit 2
+      }
+      ;;
+    /api/oidc/clients/*|/api/api-access/*)
+      local endpoint_id="${endpoint_path##*/}"
+      [[ "$endpoint_id" =~ ^[A-Za-z0-9_-]{1,128}$ ]] || {
+        printf 'refusing an unrecognized Pocket ID API path: %s\n' "$endpoint_path" >&2
+        exit 2
+      }
+      ;;
+    *)
+      printf 'refusing an unrecognized Pocket ID API path: %s\n' "$endpoint_path" >&2
+      exit 2
+      ;;
+  esac
   if [[ -n "$body_file" ]]; then
+    # The base URL is fixed above and endpoint_path is restricted to the API route allowlist.
+    # foxguard: ignore[bash/taint-ssrf]
     http_code="$(curl --silent --show-error --config "$api_config" --output "$api_response" --write-out '%{http_code}' --request "$method" --header 'Content-Type: application/json' --data-binary "@$body_file" "$POCKET_ID_URL$endpoint_path")"
   else
+    # The base URL is fixed above and endpoint_path is restricted to the API route allowlist.
+    # foxguard: ignore[bash/taint-ssrf]
     http_code="$(curl --silent --show-error --config "$api_config" --output "$api_response" --write-out '%{http_code}' --request "$method" "$POCKET_ID_URL$endpoint_path")"
   fi
   if [[ ! "$http_code" =~ ^2[0-9][0-9]$ ]]; then
