@@ -1,4 +1,9 @@
 /target
 /.env
 /.git
-
+/apps/practice/node_modules/
+/apps/practice/.expo/
+/apps/practice/dist/
+/apps/practice/.env
+/apps/practice/.env.*
+!/apps/practice/.env.example

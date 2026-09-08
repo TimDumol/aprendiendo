@@ -1,0 +1,31 @@
+services:
+  practice-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.practice
+    env_file:
+      - path: ./apps/practice/.env.mvp
+        required: false
+      - path: ./apps/practice/.env.mcp
+        required: false
+      - path: ./apps/practice/.env
+        required: false
+    environment:
+      MVP_BIND_ADDR: 0.0.0.0:8082
+      MVP_WEB_ORIGIN: http://localhost:8081
+      RUST_LOG: practice_mvp=info,aprendiendo_mcp::practice_mvp=info
+    ports:
+      - "127.0.0.1:8082:8082"
+    restart: unless-stopped
+
+  practice-web:
+    build:
+      context: ./apps/practice
+      dockerfile: Dockerfile.web
+      args:
+        EXPO_PUBLIC_MVP_API_URL: http://localhost:8082
+    depends_on:
+      - practice-api
+    ports:
+      - "127.0.0.1:8081:80"
+    restart: unless-stopped

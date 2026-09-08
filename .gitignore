@@ -19,3 +19,16 @@ data/*.sqlite3-shm
 data/*.sqlite3-wal
 /data/
 .pocket-id-api-key
+
+# Local Expo practice MVP artifacts
+/apps/practice/node_modules/
+/apps/practice/.expo/
+/apps/practice/dist/
+/apps/practice/web-build/
+/apps/practice/android/
+/apps/practice/.env
+/apps/practice/.env.*
+!/apps/practice/.env.example
+/apps/practice/*.webm
+/apps/practice/*.m4a
+/apps/practice/*.mp4

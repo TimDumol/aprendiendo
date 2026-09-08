@@ -107,6 +107,46 @@ OIDC_JWKS_URL="${APRENDIENDO_OIDC_JWKS_URL:-$(read_main_var mcp_oidc_jwks_url)}"
   exit 2
 }
 
+PRACTICE_ENV_FILE="${APRENDIENDO_PRACTICE_ENV_FILE:-$ROOT/apps/practice/.env.mcp}"
+PRACTICE_VARS_ARGS=()
+if [[ -f "$PRACTICE_ENV_FILE" ]]; then
+  PRACTICE_VARS_FILE="$LOG_DIR/practice-vars.json"
+  python3 - "$PRACTICE_ENV_FILE" "$PRACTICE_VARS_FILE" <<'PY'
+import json
+import pathlib
+import sys
+
+source, destination = map(pathlib.Path, sys.argv[1:])
+values = {}
+for raw in source.read_text().splitlines():
+    line = raw.strip()
+    if not line or line.startswith("#") or "=" not in line:
+        continue
+    key, value = line.split("=", 1)
+    key = key.strip()
+    if key not in {"GEMINI_API_KEY", "GEMINI_MODEL"}:
+        continue
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        value = value[1:-1]
+    values[key] = value
+
+if not values.get("GEMINI_API_KEY"):
+    raise SystemExit(f"{source} does not contain a non-empty GEMINI_API_KEY")
+
+destination.write_text(
+    json.dumps(
+        {
+            "mcp_gemini_api_key": values["GEMINI_API_KEY"],
+            "mcp_gemini_model": values.get("GEMINI_MODEL", "gemini-3.8-flash"),
+        }
+    )
+)
+PY
+  chmod 600 "$PRACTICE_VARS_FILE"
+  PRACTICE_VARS_ARGS=(--extra-vars "@$PRACTICE_VARS_FILE")
+fi
+
 echo "Aprendiendo release -> $PUBLIC_URL"
 run_quietly "tests" "$LOG_DIR/tests.log" \
   cargo test --manifest-path "$ROOT/Cargo.toml" --locked --quiet
@@ -147,7 +187,8 @@ run_quietly "image transfer" "$LOG_DIR/image-transfer.log" \
   stream_image "$IMAGE_REF"
 run_quietly "deploy" "$LOG_DIR/deploy.log" \
   bash -c 'cd "$1" && shift && exec "$@"' _ "$ANSIBLE_DIR" \
-  "${ANSIBLE[@]}" site.yml --extra-vars "mcp_image=$IMAGE_REF" "${VAULT_ARGS[@]}"
+  "${ANSIBLE[@]}" site.yml --extra-vars "mcp_image=$IMAGE_REF" \
+  "${PRACTICE_VARS_ARGS[@]}" "${VAULT_ARGS[@]}"
 
 curl_json() {
   curl --fail --silent --show-error \

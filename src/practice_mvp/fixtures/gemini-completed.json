@@ -1,0 +1,30 @@
+{
+  "id": "mvp-fixture",
+  "object": "interaction",
+  "model": "gemini-3.8-flash",
+  "status": "completed",
+  "usage": {
+    "total_input_tokens": 1200,
+    "total_output_tokens": 800,
+    "total_thought_tokens": 100,
+    "total_tokens": 2100
+  },
+  "steps": [
+    {
+      "type": "thought",
+      "signature": "sanitized-fixture-signature",
+      "summary": [
+        {"type": "text", "text": "This thought is intentionally ignored by the adapter."}
+      ]
+    },
+    {
+      "type": "model_output",
+      "content": [
+        {
+          "type": "text",
+          "text": "{\"summary\":\"You explained the change of plans and how you reacted.\",\"transcript\":\"Pues, el tren se canceló y tuve que buscar otra manera de llegar.\",\"strengths\":[{\"category\":\"language\",\"observation\":\"You connected the event and your response clearly.\",\"quote\":\"tuve que buscar otra manera de llegar\",\"suggestion\":null,\"start_seconds\":12.5,\"end_seconds\":21.5}],\"improvements\":[{\"category\":\"language\",\"observation\":\"Try making the cause-and-effect link even more explicit.\",\"quote\":\"el tren se canceló\",\"suggestion\":\"Add a short connector such as por eso when it helps the listener.\",\"start_seconds\":21.0,\"end_seconds\":25.0},{\"category\":\"delivery\",\"observation\":\"A brief pause before the final action makes the sequence easier to follow.\",\"quote\":null,\"suggestion\":\"Keep the pause, then continue with the action.\",\"start_seconds\":null,\"end_seconds\":null}],\"limitations\":[]}" 
+        }
+      ]
+    }
+  ]
+}

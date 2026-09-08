@@ -2,6 +2,12 @@
 
 A small, project-scoped Model Context Protocol server for the **Aprendiendo Español** ChatGPT project. It provides stable learning operations backed by SQLite.
 
+The API-powered recording-and-feedback app is documented in the
+[implementation handoff](docs/recording-app/README.md) and implemented in
+[`apps/practice`](apps/practice/README.md). Its native foundation adds private
+offline media, durable jobs, and a separately bounded practice worker; physical
+device/provider validation remains tracked in [`mobile-validation.md`](docs/recording-app/mobile-validation.md).
+
 ## Tool surface
 
 - `get_learning_context`
@@ -151,6 +157,8 @@ The endpoints are:
 - `GET /health` — process liveness
 - `GET /ready` — SQLite connectivity
 - `GET /.well-known/oauth-protected-resource` — OAuth resource metadata
+- `POST /api/practice/v1/uploads` — authenticated durable practice media upload
+- `POST /api/practice/v1/analyses` — authenticated queued delivery/coaching job
 
 Test `/mcp` with the MCP Inspector. Initialization, all tool schemas, invalid inputs, authorization, and representative tool calls should be checked before connecting ChatGPT.
 

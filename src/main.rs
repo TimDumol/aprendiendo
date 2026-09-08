@@ -5,6 +5,7 @@ use aprendiendo_mcp::{
     auth::{Authenticator, protected_resource_metadata, require_auth},
     config::Config,
     db::{SharedStore, SqliteStore},
+    practice,
     server::LearningServer,
 };
 use axum::{
@@ -90,6 +91,13 @@ async fn main() -> Result<()> {
         // paths into 401s instead of the expected 404.
         .route_layer(middleware::from_fn_with_state(auth.clone(), require_auth));
 
+    // Mobile recording jobs share the authenticated learner boundary but keep
+    // media files and job state in a separately bounded store. A worker binary
+    // consumes queued jobs so the MCP process does not perform media decoding
+    // or provider work inline.
+    let practice_routes = practice::router(&config.database_path)?
+        .route_layer(middleware::from_fn_with_state(auth.clone(), require_auth));
+
     let auth_routes = Router::new()
         .route("/health", get(health))
         .route(
@@ -101,6 +109,7 @@ async fn main() -> Result<()> {
     let mut app = Router::new()
         .merge(auth_routes)
         .route("/ready", get(readiness).with_state(AppState { store }))
+        .merge(practice_routes)
         .merge(protected);
 
     if let Authenticator::EmbeddedOauth(config_arc, state) = auth {

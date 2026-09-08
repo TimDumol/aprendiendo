@@ -151,6 +151,12 @@
           BIND_ADDR=0.0.0.0:8080
           MAX_REQUEST_BYTES=131072
           RUST_LOG=aprendiendo_mcp=info,tower_http=info
+          GEMINI_MODEL={{ mcp_gemini_model | default('gemini-3.8-flash') }}
+          GEMINI_API_KEY={{ mcp_gemini_api_key | default('', true) }}
+          PRACTICE_MEDIA_DIR=/data/practice-media
+          PRACTICE_SERVER_AUDIO_CAP_BYTES={{ mcp_practice_server_audio_cap_bytes | default(524288000) }}
+          PRACTICE_MONTHLY_SPEND_CAP_USD={{ mcp_practice_monthly_spend_cap_usd | default(1.0) }}
+          PRACTICE_ANALYSIS_RESERVATION_USD={{ mcp_practice_analysis_reservation_usd | default(0.10) }}
           AUTH_MODE={{ mcp_auth_mode }}
           PUBLIC_BASE_URL={{ mcp_public_base_url }}
           OIDC_ISSUER={{ mcp_oidc_issuer }}
@@ -209,6 +215,25 @@
               networks:
                 default: {}
                 caddy-edge: {}
+            practice-worker:
+              image: "{{ mcp_image }}"
+              pull_policy: never
+              entrypoint: ["/usr/local/bin/practice_worker"]
+              restart: unless-stopped
+              env_file: .env
+              read_only: true
+              tmpfs:
+                - /tmp:size=16m,mode=1777
+              volumes:
+                - {{ mcp_deploy_dir }}/app/data:/data
+              mem_limit: 256m
+              pids_limit: 256
+              cap_drop:
+                - ALL
+              security_opt:
+                - no-new-privileges:true
+              networks:
+                default: {}
             caddy:
               image: {{ mcp_caddy_image }}
               restart: unless-stopped

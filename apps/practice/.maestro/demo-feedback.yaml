@@ -1,0 +1,36 @@
+appId: com.timdumol.aprendiendo.practice
+name: Offline demo feedback
+tags:
+  - smoke
+---
+- launchApp:
+    clearState: true
+- extendedWaitUntil:
+    visible: "Start practice"
+    timeout: 10000
+- tapOn: "Free speaking"
+- extendedWaitUntil:
+    visible: "Speak about something real"
+    timeout: 10000
+
+- tapOn: "Demo"
+- scrollUntilVisible:
+    element: "Demo feedback — not an assessment of your recording"
+    direction: DOWN
+    timeout: 10000
+- assertVisible: "Demo feedback — not an assessment of your recording"
+- assertVisible: "What came across"
+- assertVisible: "Keep doing this"
+- assertVisible: "Work on this next"
+- scrollUntilVisible:
+    element: "Transcript ⌄"
+    direction: DOWN
+    timeout: 10000
+- tapOn: "Transcript ⌄"
+- assertVisible: "Pues, el tren se canceló y tuve que buscar otra manera de llegar. Al final tomé un autobús."
+- scrollUntilVisible:
+    element: "Show model details"
+    direction: DOWN
+    timeout: 10000
+- tapOn: "Show model details"
+- assertVisible: "Fixture mode; no model call was made."

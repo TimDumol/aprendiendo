@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-labelledby="title desc">
+  <title id="title">Aprendiendo logo</title>
+  <desc id="desc">A terracotta A rising from an open book on a warm cream tile.</desc>
+
+  <rect width="1024" height="1024" fill="#A34F2D"/>
+  <rect x="112" y="112" width="800" height="800" rx="190" fill="#FFFAF6"/>
+
+  <path
+    fill="#E4A16C"
+    d="M246 720c91-65 176-57 266 11 90-68 175-76 266-11v82c-91-59-176-54-266 12-90-66-175-71-266-12v-82Z"
+  />
+  <path
+    fill="#A34F2D"
+    fill-rule="evenodd"
+    d="m512 254 170 438h-88l-37-104h-90l-37 104h-88l170-438Zm0 125-43 128h86l-43-128Z"
+  />
+  <circle cx="752" cy="286" r="25" fill="#E4A16C"/>
+</svg>

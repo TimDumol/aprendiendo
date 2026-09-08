@@ -1,0 +1,21 @@
+FROM rust:1.98-bookworm AS builder
+
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+COPY sql/sqlite_schema.sql ./sql/sqlite_schema.sql
+COPY sql/taxonomy_migration.sql ./sql/taxonomy_migration.sql
+RUN cargo build --locked --release --bin practice_mvp
+
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --uid 65532 --no-create-home practice
+
+COPY --from=builder /build/target/release/practice_mvp /usr/local/bin/practice_mvp
+
+USER 65532:65532
+EXPOSE 8082
+ENTRYPOINT ["/usr/local/bin/practice_mvp"]

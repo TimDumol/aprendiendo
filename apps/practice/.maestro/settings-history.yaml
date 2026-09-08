@@ -1,0 +1,29 @@
+appId: com.timdumol.aprendiendo.practice
+name: Settings and history navigation
+tags:
+  - smoke
+---
+- launchApp:
+    clearState: true
+- extendedWaitUntil:
+    visible: "Start practice"
+    timeout: 10000
+- tapOn: "Settings & storage"
+- extendedWaitUntil:
+    visible: "Audio retention"
+    timeout: 10000
+- assertVisible: "Analysis controls"
+- assertVisible: "Accessibility & language"
+- scrollUntilVisible:
+    element: "Open history & export"
+    direction: DOWN
+    timeout: 10000
+- tapOn: "Open history & export"
+- extendedWaitUntil:
+    visible: "No saved practice yet"
+    timeout: 10000
+- assertVisible: "Search topics or modes"
+- pressKey: BACK
+- extendedWaitUntil:
+    visible: "Audio retention"
+    timeout: 10000

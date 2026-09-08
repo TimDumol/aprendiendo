@@ -14,6 +14,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/target/release/aprendiendo-mcp /usr/local/bin/aprendiendo-mcp
+COPY --from=builder /build/target/release/practice_worker /usr/local/bin/practice_worker
 
 COPY --from=builder /build/target/release/migrate /usr/local/bin/migrate
 

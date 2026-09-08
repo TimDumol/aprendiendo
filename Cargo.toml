@@ -9,7 +9,7 @@ description = "Project-scoped MCP server for the Aprendiendo Espanol ChatGPT pro
 [dependencies]
 anyhow = "1.0"
 async-trait = "0.1"
-axum = "0.8"
+axum = { version = "0.8", features = ["multipart"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 dotenvy = "0.15"
 jsonwebtoken = { version = "11.0.0", default-features = false, features = ["rust_crypto", "use_pem"] }
@@ -23,7 +23,7 @@ tokio = { version = "1.47", features = ["macros", "net", "rt-multi-thread", "sig
 tokio-util = "0.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-tower-http = { version = "0.6", features = ["trace"] }
+tower-http = { version = "0.6", features = ["trace", "cors"] }
 argon2 = "0.5.3"
 rand = "0.10.2"
 rsa = "0.9.10"
@@ -36,6 +36,11 @@ sha2 = "0.11.0"
 fsrs = "=6.6.2"
 chrono = { version = "0.4.42", default-features = false, features = ["clock", "std"] }
 chrono-tz = "=0.10.4"
+symphonia = { version = "0.5.4", default-features = false, features = ["aac", "isomp4", "ogg", "vorbis", "wav", "pcm"] }
+image = { version = "0.25.8", default-features = false, features = ["jpeg", "png", "webp"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
 
 [profile.release]
 codegen-units = 1

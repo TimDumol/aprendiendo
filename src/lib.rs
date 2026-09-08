@@ -11,3 +11,6 @@ pub mod server;
 pub mod taxonomy;
 
 pub mod production;
+
+pub mod practice;
+pub mod practice_mvp;

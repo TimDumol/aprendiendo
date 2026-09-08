@@ -1,0 +1,15 @@
+FROM node:20-bookworm-slim AS builder
+
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci
+COPY . .
+
+ARG EXPO_PUBLIC_MVP_API_URL=http://localhost:8082
+ENV EXPO_PUBLIC_MVP_API_URL=${EXPO_PUBLIC_MVP_API_URL}
+RUN npm run export:web
+
+FROM nginx:1.27-alpine
+
+COPY --from=builder /app/dist /usr/share/nginx/html
+EXPOSE 80

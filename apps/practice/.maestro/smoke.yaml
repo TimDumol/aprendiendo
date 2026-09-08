@@ -1,0 +1,37 @@
+appId: com.timdumol.aprendiendo.practice
+name: Practice mode smoke test
+tags:
+  - smoke
+---
+- launchApp:
+    clearState: true
+- extendedWaitUntil:
+    visible: "Start practice"
+    timeout: 10000
+- assertVisible: "Aprendiendo"
+- assertVisible: "Spanish speaking practice that stays useful offline."
+
+- tapOn: "4–3–2 practice"
+- extendedWaitUntil:
+    visible: "Round 1"
+    timeout: 10000
+- assertVisible: "Keep the message and adapt the delivery as the available time becomes shorter."
+- tapOn: "‹ Practice choices"
+
+- tapOn: "Describe a photo"
+- extendedWaitUntil:
+    visible: "Begin 2:00 preparation"
+    timeout: 10000
+- assertVisible: "Describe a photo"
+- tapOn: "Begin 2:00 preparation"
+- extendedWaitUntil:
+    visible: "Prepare your description."
+    timeout: 10000
+- tapOn: "‹ Practice choices"
+
+- tapOn: "Free speaking"
+- extendedWaitUntil:
+    visible: "Speak about something real"
+    timeout: 10000
+- assertVisible: "A change of plans"
+- assertVisible: "Record"
