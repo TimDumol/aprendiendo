@@ -9,7 +9,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params, types::ValueR
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 
-const LATEST_VERSION: i64 = 10;
+const LATEST_VERSION: i64 = 12;
 const MIGRATIONS: &[(i64, &str, &str)] = &[
     (3, "003_baseline_snapshot", "aprendiendo-schema-3-snapshot"),
     (4, "004_taxonomy_graph", "aprendiendo-taxonomy-graph-v1"),
@@ -35,6 +35,12 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "010_spontaneous_production",
         "aprendiendo-spontaneous-production-v1",
     ),
+    (
+        11,
+        "011_structured_feedback_findings",
+        "aprendiendo-structured-feedback-findings-v1",
+    ),
+    (12, "012_task_references", "aprendiendo-task-references-v1"),
 ];
 
 pub fn run(c: &mut Connection) -> Result<()> {
@@ -80,6 +86,7 @@ fn initialize_latest(c: &mut Connection) -> Result<()> {
     let tx = c.transaction()?;
     tx.execute_batch(include_str!("../sql/sqlite_schema.sql"))?;
     tx.execute_batch(crate::production::DDL)?;
+    tx.execute_batch(FINDINGS_DDL)?;
     seed_activity_types(&tx)?;
     seed_taxonomy(&tx)?;
     insert_default_scheduler(&tx)?;
@@ -87,8 +94,8 @@ fn initialize_latest(c: &mut Connection) -> Result<()> {
         record_version(&tx, version)?;
     }
     tx.execute(
-        "INSERT INTO schema_meta(key,value) VALUES('schema_version','10')
-         ON CONFLICT(key) DO UPDATE SET value='10'",
+        "INSERT INTO schema_meta(key,value) VALUES('schema_version','12')
+         ON CONFLICT(key) DO UPDATE SET value='12'",
         [],
     )?;
     tx.commit()?;
@@ -100,6 +107,7 @@ fn initialize_legacy_catalog(c: &mut Connection) -> Result<()> {
     add_legacy_columns(&tx)?;
     tx.execute_batch(include_str!("../sql/sqlite_schema.sql"))?;
     tx.execute_batch(crate::production::DDL)?;
+    tx.execute_batch(FINDINGS_DDL)?;
     seed_activity_types(&tx)?;
     seed_taxonomy(&tx)?;
     insert_default_scheduler(&tx)?;
@@ -107,8 +115,8 @@ fn initialize_legacy_catalog(c: &mut Connection) -> Result<()> {
         record_version(&tx, version)?;
     }
     tx.execute(
-        "INSERT INTO schema_meta(key,value) VALUES('schema_version','10')
-         ON CONFLICT(key) DO UPDATE SET value='10'",
+        "INSERT INTO schema_meta(key,value) VALUES('schema_version','12')
+         ON CONFLICT(key) DO UPDATE SET value='12'",
         [],
     )?;
     tx.commit()?;
@@ -187,6 +195,8 @@ fn apply_migration(c: &mut Connection, version: i64) -> Result<()> {
         7 => migration_cleanup(&tx)?,
         8 => migration_activities(&tx)?,
         10 => tx.execute_batch(crate::production::DDL)?,
+        11 => tx.execute_batch(FINDINGS_DDL)?,
+        12 => migration_task_references(&tx)?,
         9 => unreachable!("migration 9 uses the connection-level migration path"),
         _ => bail!("unsupported migration version {version}"),
     }
@@ -198,6 +208,17 @@ fn apply_migration(c: &mut Connection, version: i64) -> Result<()> {
     )?;
     tx.commit()?;
     postflight_at(c, version).with_context(|| format!("postflight after migration {version}"))
+}
+
+fn migration_task_references(tx: &Transaction<'_>) -> Result<()> {
+    if !column_exists(tx, "sessions", "task_ref")? {
+        tx.execute("ALTER TABLE sessions ADD COLUMN task_ref TEXT", [])?;
+    }
+    tx.execute_batch(
+        "CREATE INDEX IF NOT EXISTS sessions_task_ref_idx
+         ON sessions(task_ref, session_date DESC, id DESC);",
+    )?;
+    Ok(())
 }
 
 fn migration_taxonomy(tx: &Transaction<'_>) -> Result<()> {
@@ -1135,6 +1156,29 @@ fn is_exact_schema3_snapshot(c: &Connection) -> Result<bool> {
 
 const TAXONOMY_DDL: &str = include_str!("../sql/taxonomy_migration.sql");
 
+const FINDINGS_DDL: &str = "CREATE TABLE IF NOT EXISTS session_findings (
+  id INTEGER PRIMARY KEY,
+  session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  practice_item_id INTEGER,
+  attempt_id INTEGER,
+  assessment_kind TEXT NOT NULL CHECK (assessment_kind IN (
+    'error', 'awkward', 'regional_variant', 'stylistic_improvement', 'accepted'
+  )),
+  original TEXT NOT NULL,
+  suggestion TEXT,
+  note TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  FOREIGN KEY (practice_item_id, session_id)
+    REFERENCES practice_items(id, session_id) ON DELETE CASCADE,
+  FOREIGN KEY (attempt_id, session_id)
+    REFERENCES attempts(id, session_id) ON DELETE CASCADE,
+  CHECK (practice_item_id IS NOT NULL OR attempt_id IS NOT NULL OR original <> '')
+);
+CREATE INDEX IF NOT EXISTS session_findings_session_idx
+  ON session_findings(session_id, id);
+CREATE INDEX IF NOT EXISTS session_findings_kind_idx
+  ON session_findings(session_id, assessment_kind);";
+
 const SCHEMES: &[(&str, &str)] = &[
     ("linguistic_form", "Linguistic form"),
     ("communicative_use", "Communicative use"),
@@ -1957,7 +2001,7 @@ mod tests {
             c.query_row("SELECT count(*) FROM schema_migrations", [], |r| r
                 .get::<_, i64>(0))
                 .unwrap(),
-            8
+            10
         );
         assert!(!table_exists(&c, "exercise_types").unwrap());
         assert_eq!(
@@ -1967,6 +2011,7 @@ mod tests {
                 "session_date",
                 "exercise_type_key",
                 "topic",
+                "task_ref",
                 "notes",
                 "created_at"
             ]

@@ -34,12 +34,21 @@ pub struct TaxonomyRequest {
 #[serde(rename_all = "snake_case")]
 pub enum DetailMode {
     Summary,
+    /// Summary plus compact production evidence without raw attempts/items.
+    Evidence,
     Full,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RecentPracticeRequest {
+    /// Return one exact recorded session when supplied.
+    #[schemars(range(min = 1))]
+    pub session_id: Option<i64>,
+    /// Stable caller-assigned reference for a repeated task or prompt family.
+    /// Use limit=1 to retrieve the immediately preceding related attempt.
+    #[schemars(length(min = 1, max = 160))]
+    pub task_ref: Option<String>,
     pub limit: Option<u16>,
     pub skill: Option<String>,
     /// Canonical exercise type keys to include.
@@ -179,6 +188,31 @@ pub enum ObservationSeverity {
     Blocking,
 }
 
+/// A structured feedback finding is durable tutor feedback. It is deliberately
+/// separate from observations so style and acceptance notes do not affect
+/// weakness counts or scheduling.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum FindingKind {
+    Error,
+    Awkward,
+    RegionalVariant,
+    StylisticImprovement,
+    Accepted,
+}
+
+impl FindingKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Error => "error",
+            Self::Awkward => "awkward",
+            Self::RegionalVariant => "regional_variant",
+            Self::StylisticImprovement => "stylistic_improvement",
+            Self::Accepted => "accepted",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AssessmentPhase {
@@ -281,6 +315,25 @@ pub struct ObservationInput {
     pub correction: Option<String>,
     pub error_span: Option<String>,
     pub notes: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FindingInput {
+    /// Optional canonical practice item linkage.
+    #[schemars(range(min = 1))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub practice_item_no: Option<u16>,
+    /// Optional canonical attempt linkage.
+    #[schemars(range(min = 1))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attempt_no: Option<u16>,
+    pub assessment_kind: FindingKind,
+    pub original: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suggestion: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 fn default_incidental() -> ObservationRole {
@@ -668,7 +721,7 @@ pub enum PracticeItemOutcome {
     Omitted,
 }
 
-#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct NewWeaknessInput {
     pub key: String,
@@ -978,6 +1031,10 @@ pub struct RecordPracticeSessionResponse {
     pub reflection_count: usize,
     pub new_weaknesses_created: Vec<String>,
     pub review_updates: Vec<ReviewUpdate>,
+    /// Counts of structured feedback findings by assessment kind. These are
+    /// feedback counts, not observation or error counts.
+    #[serde(default)]
+    pub finding_counts: std::collections::BTreeMap<String, usize>,
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
@@ -995,6 +1052,12 @@ pub struct RecordPracticeSessionRequest {
     /// RFC 3339 timestamp used to derive the learning day when supplied.
     #[schemars(regex(pattern = r"^\d{4}-\d{2}-\d{2}T"))]
     pub reviewed_at: Option<String>,
+    /// Stable caller-assigned reference for the task or prompt family. It is
+    /// not required to be globally unique; retrieval can select the newest
+    /// related session with task_ref plus limit=1.
+    #[schemars(length(min = 1, max = 160))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_ref: Option<String>,
     /// One of the six canonical exercise type keys.
     pub exercise_type_key: ExerciseTypeKey,
     /// Optional nonblank topic; max 500 UTF-8 bytes.
@@ -1015,6 +1078,9 @@ pub struct RecordPracticeSessionRequest {
     #[schemars(length(max = 300))]
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub observations: Vec<ObservationInput>,
+    #[schemars(length(max = 300))]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub findings: Vec<FindingInput>,
     #[schemars(length(max = 100))]
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reviews: Vec<ReviewInput>,

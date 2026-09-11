@@ -7,6 +7,7 @@ use aprendiendo_mcp::{
     db::{SharedStore, SqliteStore},
     practice,
     server::LearningServer,
+    telemetry,
 };
 use axum::{
     Json, Router,
@@ -21,7 +22,6 @@ use serde_json::json;
 use tokio_util::sync::CancellationToken;
 use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
 use tracing::{Level, info, warn};
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Clone)]
 struct AppState {
@@ -31,13 +31,7 @@ struct AppState {
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
-    tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "aprendiendo_mcp=info,tower_http=info".into()),
-        )
-        .with(tracing_subscriber::fmt::layer())
-        .init();
+    telemetry::init_tracing()?;
 
     let config = Config::from_env()?;
     let store: SharedStore = Arc::new(SqliteStore::new(&config.database_path)?);

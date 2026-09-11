@@ -32,3 +32,4 @@ data/*.sqlite3-wal
 /apps/practice/*.webm
 /apps/practice/*.m4a
 /apps/practice/*.mp4
+*.pyc

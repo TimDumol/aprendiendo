@@ -9,6 +9,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     'guided_conversation'
   )),
   topic TEXT,
+  task_ref TEXT,
   notes TEXT,
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
@@ -252,6 +253,29 @@ CREATE TABLE IF NOT EXISTS attempt_reflections (
 CREATE INDEX IF NOT EXISTS attempt_reflections_attempt_idx
   ON attempt_reflections(attempt_id, reflection_no);
 
+CREATE TABLE IF NOT EXISTS session_findings (
+  id INTEGER PRIMARY KEY,
+  session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  practice_item_id INTEGER,
+  attempt_id INTEGER,
+  assessment_kind TEXT NOT NULL CHECK (assessment_kind IN (
+    'error', 'awkward', 'regional_variant', 'stylistic_improvement', 'accepted'
+  )),
+  original TEXT NOT NULL,
+  suggestion TEXT,
+  note TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  FOREIGN KEY (practice_item_id, session_id)
+    REFERENCES practice_items(id, session_id) ON DELETE CASCADE,
+  FOREIGN KEY (attempt_id, session_id)
+    REFERENCES attempts(id, session_id) ON DELETE CASCADE,
+  CHECK (practice_item_id IS NOT NULL OR attempt_id IS NOT NULL OR original <> '')
+);
+CREATE INDEX IF NOT EXISTS session_findings_session_idx
+  ON session_findings(session_id, id);
+CREATE INDEX IF NOT EXISTS session_findings_kind_idx
+  ON session_findings(session_id, assessment_kind);
+
 CREATE TABLE IF NOT EXISTS observations (
   id INTEGER PRIMARY KEY, session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
   attempt_id INTEGER, practice_item_id INTEGER, weakness_id INTEGER NOT NULL REFERENCES weaknesses(id),
@@ -341,3 +365,4 @@ CREATE INDEX IF NOT EXISTS practice_items_activity_run_idx ON practice_items(act
 CREATE INDEX IF NOT EXISTS practice_item_targets_weakness_idx ON practice_item_targets(weakness_id, practice_item_id);
 CREATE INDEX IF NOT EXISTS prompt_fingerprint_created_idx ON practice_items(prompt_fingerprint, created_at);
 CREATE INDEX IF NOT EXISTS attempts_response_mode_session_idx ON attempts(response_mode, session_id);
+CREATE INDEX IF NOT EXISTS sessions_task_ref_idx ON sessions(task_ref, session_date DESC, id DESC);

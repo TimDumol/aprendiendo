@@ -1,0 +1,226 @@
+{
+  "idempotency_key": "tutoring-canonical-20260909-01",
+  "exercise_type_key": "dele_a2_oral_microdrill",
+  "topic": "Un cambio de planes y una actividad reciente",
+  "notes": "One normal tutoring session with a prompted retry.",
+  "new_weaknesses": [
+    {
+      "key": "incidental.para_que.subjunctive",
+      "category": "grammar",
+      "description": "Use the subjunctive after para que when it is needed in ordinary speech.",
+      "target_pattern": "para que + subjuntivo",
+      "target_type": "grammatical_construction"
+    }
+  ],
+  "items": [
+    {
+      "item_no": 1,
+      "drill_type": "situational_response",
+      "prompt": "Cuéntale a tu compañero qué problema has estado investigando y qué cambió hoy.",
+      "target_weakness_keys": ["duration_llevar_gerund"]
+    },
+    {
+      "item_no": 2,
+      "drill_type": "question_answer",
+      "prompt": "¿Qué actividad has mantenido durante este mes y cómo te ha cambiado los planes?",
+      "target_weakness_keys": ["duration_llevar_gerund"]
+    }
+  ],
+  "attempts": [
+    {
+      "attempt_no": 1,
+      "practice_item_no": 1,
+      "transcript": "Llevo dos horas investigo el problema y cambiaron la reunión.",
+      "response_mode": "spoken_transcript",
+      "observations": [
+        {
+          "observation_no": 1,
+          "weakness_key": "duration_llevar_gerund",
+          "outcome": "incorrect",
+          "role": "targeted",
+          "assessment_phase": "cold_retrieval",
+          "hint_level": "none",
+          "evidence_strength": "spontaneous_production",
+          "learner_effort": "some_effort",
+          "produced": "Llevo dos horas investigo",
+          "correction": "Llevo dos horas investigando"
+        },
+        {
+          "observation_no": 2,
+          "weakness_key": "incidental.para_que.subjunctive",
+          "outcome": "incorrect",
+          "produced": "para que cambia",
+          "correction": "para que cambie"
+        }
+      ]
+    },
+    {
+      "attempt_no": 2,
+      "practice_item_no": 1,
+      "transcript": "Llevo dos horas investigando el problema y cambiaron la reunión.",
+      "response_mode": "spoken_transcript",
+      "observations": [
+        {
+          "observation_no": 3,
+          "weakness_key": "duration_llevar_gerund",
+          "outcome": "prompted_correct",
+          "role": "targeted",
+          "assessment_phase": "immediate_retry",
+          "hint_level": "indirect",
+          "evidence_strength": "spontaneous_production",
+          "learner_effort": "some_effort",
+          "produced": "Llevo dos horas investigando"
+        }
+      ]
+    },
+    {
+      "attempt_no": 3,
+      "practice_item_no": 2,
+      "transcript": "Llevo un mes aprendiendo a pintar y ahora organizo mejor mis tardes.",
+      "response_mode": "spoken_transcript",
+      "observations": [
+        {
+          "observation_no": 4,
+          "weakness_key": "duration_llevar_gerund",
+          "outcome": "correct",
+          "role": "targeted",
+          "assessment_phase": "transfer",
+          "hint_level": "none",
+          "evidence_strength": "spontaneous_production",
+          "learner_effort": "some_effort",
+          "produced": "Llevo un mes aprendiendo"
+        }
+      ]
+    }
+  ],
+  "findings": [
+    {
+      "practice_item_no": 1,
+      "attempt_no": 2,
+      "assessment_kind": "stylistic_improvement",
+      "original": "cambiaron la reunión",
+      "suggestion": "cambiaron la hora de la reunión",
+      "note": "The shorter wording is understandable; this adds useful precision."
+    },
+    {
+      "practice_item_no": 2,
+      "attempt_no": 3,
+      "assessment_kind": "regional_variant",
+      "original": "organizo mejor mis tardes",
+      "note": "Accepted regional wording; no weakness is created."
+    }
+  ],
+  "production_evidence": {
+    "policy_version": 1,
+    "target_opportunities": [
+      {
+        "weakness_key": "duration_llevar_gerund",
+        "communicative_function": "Explain an ongoing activity in a relevant situation"
+      },
+      {
+        "weakness_key": "duration_llevar_gerund",
+        "communicative_function": "Describe a recent personal activity and its effect"
+      }
+    ],
+    "attempts": [
+      {
+        "attempt_no": 1,
+        "attempt_kind": "initial",
+        "original_attempt_no": null,
+        "prompt_cueing": "none_detected",
+        "prior_target_exposure": "none_known",
+        "communicative_outcome": "partially_successful",
+        "assessment_provenance": {
+          "kind": "tutor_judgment",
+          "evidence": "Open update delivered before any correction or target wording."
+        },
+        "scenario_tag": "coworker_update",
+        "topic_tag": "recent_problem",
+        "initial_sentence_count": 2
+      },
+      {
+        "attempt_no": 2,
+        "attempt_kind": "self_correction",
+        "original_attempt_no": 1,
+        "prompt_cueing": "none_detected",
+        "prior_target_exposure": "relevant_wording",
+        "communicative_outcome": "successful",
+        "assessment_provenance": {
+          "kind": "tutor_judgment",
+          "evidence": "The learner retried after the recorded indirect hint."
+        },
+        "scenario_tag": "coworker_update",
+        "topic_tag": "recent_problem",
+        "initial_sentence_count": 2
+      },
+      {
+        "attempt_no": 3,
+        "attempt_kind": "initial",
+        "original_attempt_no": null,
+        "prompt_cueing": "none_detected",
+        "prior_target_exposure": "none_known",
+        "communicative_outcome": "successful",
+        "assessment_provenance": {
+          "kind": "tutor_judgment",
+          "evidence": "A new personal question used a different communicative situation."
+        },
+        "scenario_tag": "personal_hobby_change",
+        "topic_tag": "hobby",
+        "initial_sentence_count": 2
+      }
+    ],
+    "observations": [
+      {
+        "observation_no": 1,
+        "attempt_no": 1,
+        "target_realization": "used",
+        "target_accuracy": "incorrect",
+        "assessment_provenance": {
+          "kind": "tutor_judgment",
+          "evidence": "The learner used llevar with a finite verb instead of the gerund."
+        }
+      },
+      {
+        "observation_no": 2,
+        "attempt_no": 1,
+        "target_realization": "attempted",
+        "target_accuracy": "incorrect",
+        "assessment_provenance": {
+          "kind": "tutor_judgment",
+          "evidence": "A new incidental wording issue appeared in the learner response."
+        }
+      },
+      {
+        "observation_no": 3,
+        "attempt_no": 2,
+        "target_realization": "used",
+        "target_accuracy": "correct",
+        "assessment_provenance": {
+          "kind": "tutor_judgment",
+          "evidence": "The prompted retry used the target form accurately."
+        }
+      },
+      {
+        "observation_no": 4,
+        "attempt_no": 3,
+        "target_realization": "used",
+        "target_accuracy": "correct",
+        "assessment_provenance": {
+          "kind": "tutor_judgment",
+          "evidence": "The learner used the target in a distinct personal situation."
+        }
+      }
+    ],
+    "interventions": [
+      {
+        "intervention_no": 1,
+        "kind": "indirect_hint",
+        "text": "Dijiste: Llevo dos horas investigo. Revisa la forma del segundo verbo.",
+        "target_weakness_keys": ["duration_llevar_gerund"],
+        "after_attempt_no": 1,
+        "before_attempt_no": 2
+      }
+    ],
+    "variation_assessments": []
+  }
+}

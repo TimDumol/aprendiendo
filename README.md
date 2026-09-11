@@ -16,6 +16,7 @@ device/provider validation remains tracked in [`mobile-validation.md`](docs/reco
 - `get_practice_preferences`
 - `update_practice_preferences`
 - `validate_practice_plan`
+- `record_tutoring_session`
 - `record_practice_session`
 - `get_review_queue`
 - `upsert_weakness`
@@ -47,6 +48,38 @@ DATABASE_PATH=data/aprendiendo.sqlite3
 ```
 
 The migrated database retains the original application tables and adds taxonomy, evidence, immutable FSRS audit state, activity runs/stimuli, practice items/targets, and `recorded_requests` for idempotency. Activity stimuli are bounded text or references; the server never stores or fetches binary media. The migration runner validates the exact live snapshot before changing it.
+
+### One-call tutoring workflow
+
+For ordinary tutoring, call `get_practice_brief`, validate each prompt with
+`validate_practice_plan` before delivery, and save the completed session once
+with `record_tutoring_session`. Put each learner-facing turn in `turns` and
+each retry in that turn's `attempts`; preserve the actual prompt, transcript,
+intervention order, observations, findings, and explicitly reported timing or
+effort. Reuse weakness keys and the policy version returned by the brief.
+Declare only new discoveries in `new_weaknesses`; an incidental discovery stays
+a candidate when it is not a declared target. Findings hold stylistic advice,
+awkward wording, and accepted regional alternatives without creating a
+weakness or changing FSRS.
+
+The compact recorder expands deterministically into the canonical storage
+contract and returns the same typed recording response. Omit production
+evidence for record-only practice; the transcript, observations, findings,
+and intervention text remain durable, while reviews remain conservative. Use
+`record_practice_session` for activity runs and other advanced canonical
+workflows. Exact retries use the identical request and idempotency key.
+
+Use `get_learning_context`, `get_recent_practice`, and `get_review_queue` only
+when their additional context is needed; the brief and recording response may
+already contain the relevant information. Keep preference actions for
+inspection or learner-requested changes. `upsert_weakness` and `upsert_concept`
+are maintenance actions for explicit curation, while `get_taxonomy` and
+`get_data_status` are occasional diagnostics. None is a prerequisite for
+saving an ordinary session.
+
+See the [compact example](examples/tutoring-compact-session.json), the
+[canonical equivalent](examples/tutoring-canonical-session.json), and the
+[recording performance guide](docs/mcp-recording-performance.md).
 
 ### Canonical practice-session contract
 
@@ -89,7 +122,8 @@ Successful calls return `status: "created"`. An exact retry with the same
 The one-time version-9 migration clears `recorded_requests` because it is
 retry metadata, while retaining sessions and all learning data. Stop the MCP
 service before applying that production migration so no request straddles the
-ledger reset. The removed legacy request/storage field is not accepted.
+ledger reset. Schema 11 adds structured session findings. The removed legacy
+request/storage field is not accepted.
 
 ## Spontaneous production
 
@@ -112,12 +146,16 @@ Active weaknesses are the FSRS memory units. The server uses the official FSRS-6
 Rust implementation with its default parameter vector and 0.90 desired retention.
 `get_practice_brief` selects due/new weaknesses, recommends drill families, and
 returns exact recent prompts to avoid; ChatGPT supplies the exercise language.
-`record_practice_session` stores each item, target, attempt, and raw observation
-atomically, then applies at most one eligible explicit rating per deliberately reviewed
-weakness. New reviews require two independent, materially varied observations and
-supported rating/effort evidence; valid ineligible proposals are saved with skip reasons. Incidental observations are retained without changing FSRS state.
-Activity-aware briefs describe one of the ten supported activities and allocate
-compatible drill items. Record each learner-facing turn separately. Spoken
+`record_tutoring_session` and `record_practice_session` store each item, target,
+attempt, raw observation, and structured finding atomically, then apply at most
+one eligible explicit rating per deliberately reviewed weakness. New reviews
+require two independent, materially varied observations and supported
+rating/effort evidence; valid ineligible proposals are saved with skip reasons.
+Incidental observations and style findings are retained without changing FSRS
+state. Activity-aware briefs describe one of the ten supported activities and
+allocate compatible drill items. Record the completed normal session once,
+with each learner-facing turn represented as an item and each retry as an
+attempt. Spoken
 answers are transcript-only; timing and hesitation data must be explicitly
 reported or externally measured and are never inferred from transcript text.
 Legacy scheduler columns remain for compatibility but are no longer updated.
@@ -144,6 +182,14 @@ Copy `.env.example` to `.env`. For local testing only:
 AUTH_MODE=disabled
 BIND_ADDR=127.0.0.1:8080
 ```
+
+Production JSON telemetry is selected with `LOG_FORMAT=json`; use
+`LOG_FORMAT=text` for local human-readable logs. Recording learner text is
+kept in a separate allowlisted `mcp_tool_text` event, which the offline
+analyzer filters by default and exposes only with `--include-text`. The
+offline analysis commands, validation diagnostics, and timing limits are
+documented in
+[`docs/mcp-recording-performance.md`](docs/mcp-recording-performance.md).
 
 Then run:
 

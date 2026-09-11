@@ -151,6 +151,7 @@
           BIND_ADDR=0.0.0.0:8080
           MAX_REQUEST_BYTES=131072
           RUST_LOG=aprendiendo_mcp=info,tower_http=info
+          LOG_FORMAT=json
           GEMINI_MODEL={{ mcp_gemini_model | default('gemini-3.8-flash') }}
           GEMINI_API_KEY={{ mcp_gemini_api_key | default('', true) }}
           PRACTICE_MEDIA_DIR=/data/practice-media

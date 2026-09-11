@@ -78,7 +78,7 @@ async fn streamable_http_lists_and_calls_domain_tools() {
     let tools = listed["result"]["tools"]
         .as_array()
         .expect("tools should be an array");
-    assert_eq!(tools.len(), 12);
+    assert_eq!(tools.len(), 13);
     assert_eq!(tools[0]["_meta"]["securitySchemes"][0]["type"], "noauth");
     let serialized = serde_json::to_string(tools).expect("tools should serialize");
     assert!(!serialized.contains("projectId"));
@@ -122,6 +122,91 @@ async fn streamable_http_lists_and_calls_domain_tools() {
             .contains("idempotency")
     );
     assert_eq!(record_tool["annotations"]["idempotentHint"], true);
+    assert!(
+        record_tool["description"]
+            .as_str()
+            .unwrap()
+            .contains("Advanced canonical fallback")
+    );
+    assert!(
+        record_tool["description"]
+            .as_str()
+            .unwrap()
+            .contains("record_tutoring_session")
+    );
+    let compact_tool = tools
+        .iter()
+        .find(|tool| tool["name"] == "record_tutoring_session")
+        .expect("compact record tool should be listed");
+    assert!(
+        compact_tool["description"]
+            .as_str()
+            .unwrap()
+            .contains("Preferred normal tutoring recorder")
+    );
+    let compact_schema = &compact_tool["inputSchema"];
+    assert_eq!(compact_schema["properties"]["turns"]["maxItems"], 100);
+    assert_eq!(
+        compact_schema["$defs"]["TutoringTurnInput"]["properties"]["attempts"]["maxItems"],
+        20
+    );
+    assert_eq!(
+        compact_schema["$defs"]["FindingKind"]["enum"],
+        json!([
+            "error",
+            "awkward",
+            "regional_variant",
+            "stylistic_improvement",
+            "accepted"
+        ])
+    );
+    assert!(
+        compact_schema["$defs"]["TutoringAttemptReference"]["properties"]["turn"]["minimum"]
+            .is_number()
+    );
+    let recent_tool = tools
+        .iter()
+        .find(|tool| tool["name"] == "get_recent_practice")
+        .expect("recent practice tool should be listed");
+    assert_eq!(
+        recent_tool["inputSchema"]["$defs"]["DetailMode"]["oneOf"][0]["enum"],
+        json!(["summary", "full"])
+    );
+    assert_eq!(
+        recent_tool["inputSchema"]["$defs"]["DetailMode"]["oneOf"][1]["const"],
+        "evidence"
+    );
+    assert!(recent_tool["inputSchema"]["properties"]["session_id"]["minimum"].is_number());
+    assert_eq!(
+        recent_tool["inputSchema"]["properties"]["task_ref"]["maxLength"],
+        160
+    );
+    let weakness_tool = tools
+        .iter()
+        .find(|tool| tool["name"] == "upsert_weakness")
+        .expect("weakness maintenance tool should be listed");
+    assert!(
+        weakness_tool["description"]
+            .as_str()
+            .unwrap()
+            .contains("Maintenance only")
+    );
+    assert!(
+        weakness_tool["description"]
+            .as_str()
+            .unwrap()
+            .contains("can activate a new weakness")
+    );
+    let concept_tool = tools
+        .iter()
+        .find(|tool| tool["name"] == "upsert_concept")
+        .expect("concept maintenance tool should be listed");
+    assert!(
+        concept_tool["description"]
+            .as_str()
+            .unwrap()
+            .contains("Maintenance only")
+    );
     let output_schema = &record_tool["outputSchema"];
     let output_data = &output_schema["$defs"]["RecordPracticeSessionResponse"];
     let output_required = output_data["required"]
@@ -254,6 +339,34 @@ async fn streamable_http_lists_and_calls_domain_tools() {
     )
     .await;
     assert_eq!(unknown_key["result"]["isError"], true);
+    let invalid_compact = post_rpc(
+        &client,
+        &url,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 80,
+            "method": "tools/call",
+            "params": {"name": "record_tutoring_session", "arguments": {
+                "idempotency_key": "protocol-invalid-compact-001",
+                "exercise_type_key": "translation_drill",
+                "unexpected_field": "sentinel-transcript"
+            }}
+        }),
+    )
+    .await;
+    assert_eq!(invalid_compact["result"]["isError"], true);
+    let unknown_tool = post_rpc(
+        &client,
+        &url,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 81,
+            "method": "tools/call",
+            "params": {"name": "not_a_registered_tool", "arguments": {}}
+        }),
+    )
+    .await;
+    assert!(unknown_tool["error"].is_object());
     let status = post_rpc(
         &client,
         &url,
