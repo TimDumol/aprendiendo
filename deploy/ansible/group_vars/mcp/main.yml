@@ -14,4 +14,4 @@ mcp_caddy_sites_dir: /opt/caddy/sites-enabled
 
 # Caddy obtains and renews the public certificate.  Cloudflare should use
 # Full (strict) mode and proxy DNS to this host; ports 80 and 443 must reach it.
-mcp_caddy_image: caddy:2.11.4
+mcp_caddy_image: caddy:2.11.7@sha256:504a44d7d74bd2bc28a66afc4774912fc21223ca8a67734af1c54ab2f999b489

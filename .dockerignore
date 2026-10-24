@@ -7,3 +7,12 @@
 /apps/practice/.env
 /apps/practice/.env.*
 !/apps/practice/.env.example
+
+# Deployment credentials and private operational state never enter build contexts.
+/.env.*
+/.pocket-id-api-key
+/.aws
+/.agents
+/.codex
+/deploy/ansible/group_vars/mcp/secrets.yml
+/data

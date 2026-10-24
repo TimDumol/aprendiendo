@@ -31,7 +31,7 @@ services:
       - no-new-privileges:true
 
   caddy:
-    image: caddy:2-alpine
+    image: caddy:2.11.7-alpine
     restart: unless-stopped
     ports:
       - "80:80"
@@ -42,6 +42,12 @@ services:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
       - caddy_config:/config
+    read_only: true
+    pids_limit: 256
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     cap_add:
       - NET_BIND_SERVICE
     depends_on:

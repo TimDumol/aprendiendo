@@ -207,7 +207,7 @@ run_quietly "bootstrap" bootstrap \
   bash -c 'cd "$1" && shift && exec "$@"' _ "$ANSIBLE_DIR" \
   "${ANSIBLE[@]}" site.yml --tags bootstrap "${VAULT_ARGS[@]}"
 run_quietly "docker build" docker-build \
-  docker build --platform "$DOCKER_PLATFORM" --tag "$IMAGE_REF" "$ROOT"
+  docker build --pull --platform "$DOCKER_PLATFORM" --tag "$IMAGE_REF" "$ROOT"
 
 stream_image() {
   local image="$1"

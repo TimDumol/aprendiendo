@@ -268,6 +268,13 @@
             caddy:
               image: {{ mcp_caddy_image }}
               restart: unless-stopped
+              read_only: true
+              pids_limit: 256
+              logging:
+                driver: json-file
+                options:
+                  max-size: "10m"
+                  max-file: "5"
               ports:
                 - "80:80"
                 - "443:443"
@@ -308,6 +315,13 @@
         content: |
           {
               admin 127.0.0.1:2019
+              servers {
+                  timeouts {
+                      read_header 10s
+                      idle 2m
+                  }
+                  max_header_size 64KB
+              }
           }
 
           import sites-enabled/*
