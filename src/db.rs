@@ -6,7 +6,8 @@ use crate::{
         ObservationInput, PracticeBriefRequest, PracticeObjective, RatingSource,
         RecentPracticeRequest, RecordPracticeSessionRequest, RecordPracticeSessionResponse,
         RecordStatus, RetrievalMode, ReviewQueueRequest, ReviewUpdate, TargetRelationInput,
-        TargetType, TaxonomyRequest, UpsertConceptRequest, UpsertWeaknessRequest,
+        TargetType, TaskRequirementSource, TaxonomyRequest, UpsertConceptRequest,
+        UpsertWeaknessRequest,
     },
     taxonomy, telemetry,
 };
@@ -251,6 +252,12 @@ pub fn validate_record_practice_request(
     list(request.reviews.len(), "reviews", 100)?;
     list(request.activity_runs.len(), "activity_runs", 10)?;
     list(request.findings.len(), "findings", 300)?;
+    list(request.task_requirements.len(), "task_requirements", 100)?;
+    list(
+        request.requested_point_assessments.len(),
+        "requested_point_assessments",
+        300,
+    )?;
 
     let mut new_keys = HashSet::new();
     for (index, weakness) in request.new_weaknesses.iter().enumerate() {
@@ -399,6 +406,62 @@ pub fn validate_record_practice_request(
         }
     }
 
+    for (index, requirement) in request.task_requirements.iter().enumerate() {
+        let path = format!("task_requirements[{index}]");
+        if requirement
+            .practice_item_no
+            .is_some_and(|number| !item_numbers.contains(&number))
+        {
+            return Err(RecordPracticeError::unknown(format!(
+                "{path}.practice_item_no references an item not in this request"
+            )));
+        }
+        text(&requirement.skill, &format!("{path}.skill"), 40)?;
+        text(&requirement.task_key, &format!("{path}.task_key"), 80)?;
+        optional_text(
+            requirement.exam_key.as_deref(),
+            &format!("{path}.exam_key"),
+            80,
+        )?;
+        optional_text(
+            requirement.specification_version.as_deref(),
+            &format!("{path}.specification_version"),
+            80,
+        )?;
+        if requirement.source == TaskRequirementSource::Official
+            && (requirement.exam_key.is_none() || requirement.specification_version.is_none())
+        {
+            return Err(RecordPracticeError::invalid(format!(
+                "{path}.official requirements need exam_key and specification_version"
+            )));
+        }
+        if requirement
+            .word_max
+            .is_some_and(|max| requirement.word_min.is_some_and(|min| max < min))
+        {
+            return Err(RecordPracticeError::invalid(format!(
+                "{path}.word_max must be at least word_min"
+            )));
+        }
+        if requirement.requested_points.len() > 50
+            || requirement
+                .requested_points
+                .iter()
+                .any(|point| point.trim().is_empty() || point.len() > 160)
+        {
+            return Err(RecordPracticeError::invalid(format!(
+                "{path}.requested_points contains an empty or oversized point"
+            )));
+        }
+        if let Some(hash) = requirement.prompt_hash.as_deref()
+            && (hash.len() != 64 || hash.chars().any(|c| !c.is_ascii_hexdigit()))
+        {
+            return Err(RecordPracticeError::invalid(format!(
+                "{path}.prompt_hash must be a SHA-256 hex digest"
+            )));
+        }
+    }
+
     let mut attempt_numbers = HashSet::new();
     for (index, attempt) in request.attempts.iter().enumerate() {
         let path = format!("attempts[{index}]");
@@ -461,6 +524,41 @@ pub fn validate_record_practice_request(
                 &format!("{path}.reflections[{reflection_index}].note"),
                 4_000,
             )?;
+        }
+    }
+    for (index, assessment) in request.requested_point_assessments.iter().enumerate() {
+        let path = format!("requested_point_assessments[{index}]");
+        if assessment.attempt_no == 0 || !attempt_numbers.contains(&assessment.attempt_no) {
+            return Err(RecordPracticeError::unknown(format!(
+                "{path}.attempt_no references an attempt not in this request"
+            )));
+        }
+        text(&assessment.point_key, &format!("{path}.point_key"), 160)?;
+        text(&assessment.evaluator, &format!("{path}.evaluator"), 160)?;
+        optional_text(
+            assessment.supporting_excerpt.as_deref(),
+            &format!("{path}.supporting_excerpt"),
+            4_000,
+        )?;
+        optional_text(
+            assessment.reason.as_deref(),
+            &format!("{path}.reason"),
+            2_000,
+        )?;
+        optional_text(
+            assessment.rubric_version.as_deref(),
+            &format!("{path}.rubric_version"),
+            160,
+        )?;
+        optional_text(
+            assessment.assessed_at.as_deref(),
+            &format!("{path}.assessed_at"),
+            128,
+        )?;
+        if assessment.supporting_excerpt.is_none() && assessment.reason.is_none() {
+            return Err(RecordPracticeError::invalid(format!(
+                "{path} needs supporting_excerpt or reason"
+            )));
         }
     }
     list(request.observations.len(), "observations", 300)?;
@@ -643,7 +741,7 @@ fn load_weaknesses(
     target_types: Option<&[TargetType]>,
     include_nonactive: bool,
 ) -> Result<Vec<WeaknessRow>> {
-    let mut sql="SELECT w.id,si.id,w.key,w.category,w.description,w.target_pattern,w.target_type,w.target_status,w.classification_pending,(SELECT c.key FROM weakness_concepts wc JOIN concepts c ON c.id=wc.concept_id WHERE wc.weakness_id=w.id AND wc.role='primary'),si.due_learning_day,si.stability,si.difficulty,si.last_review_at,(SELECT r.rating FROM weakness_reviews r WHERE r.scheduler_item_id=si.id ORDER BY r.reviewed_at DESC,r.id DESC LIMIT 1),(SELECT count(*) FROM weakness_reviews r WHERE r.scheduler_item_id=si.id),w.first_seen,w.last_seen,w.due_date,w.interval_days,w.ease_factor,w.repetitions,w.lapses,(SELECT count(*) FROM observations o WHERE o.weakness_id=w.id AND o.outcome IN ('incorrect','omitted') AND NOT EXISTS(SELECT 1 FROM unobserved_targets ut WHERE ut.session_id=o.session_id AND ut.observation_no=o.observation_no)),(SELECT count(*) FROM observations o WHERE o.weakness_id=w.id AND o.outcome IN ('correct','prompted_correct')),(SELECT count(*) FROM observations o WHERE o.weakness_id=w.id),(SELECT count(DISTINCT s.session_date) FROM observations o JOIN sessions s ON s.id=o.session_id WHERE o.weakness_id=w.id AND o.outcome IN ('incorrect','omitted') AND NOT EXISTS(SELECT 1 FROM unobserved_targets ut WHERE ut.session_id=o.session_id AND ut.observation_no=o.observation_no)),(SELECT max(s.session_date) FROM observations o JOIN sessions s ON s.id=o.session_id WHERE o.weakness_id=w.id AND o.outcome IN ('incorrect','omitted') AND NOT EXISTS(SELECT 1 FROM unobserved_targets ut WHERE ut.session_id=o.session_id AND ut.observation_no=o.observation_no)),(SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM observations bad JOIN sessions sb ON sb.id=bad.session_id WHERE bad.weakness_id=w.id AND bad.outcome IN ('incorrect','omitted') AND NOT EXISTS(SELECT 1 FROM unobserved_targets ut WHERE ut.session_id=bad.session_id AND ut.observation_no=bad.observation_no) AND sb.session_date > (SELECT max(sx.session_date) FROM observations bx JOIN sessions sx ON sx.id=bx.session_id WHERE bx.weakness_id=w.id AND bx.outcome IN ('incorrect','omitted') AND NOT EXISTS(SELECT 1 FROM unobserved_targets ut WHERE ut.session_id=bx.session_id AND ut.observation_no=bx.observation_no))) THEN 1 ELSE 0 END),COALESCE((SELECT c.key FROM weakness_concepts wc JOIN concepts c ON c.id=wc.concept_id WHERE wc.weakness_id=w.id AND wc.role='primary'),'') FROM weaknesses w LEFT JOIN scheduler_items si ON si.weakness_id=w.id AND si.track='general' ".to_owned();
+    let mut sql="SELECT w.id,si.id,w.key,w.category,w.description,w.target_pattern,w.target_type,w.target_status,w.classification_pending,(SELECT c.key FROM weakness_concepts wc JOIN concepts c ON c.id=wc.concept_id WHERE wc.weakness_id=w.id AND wc.role='primary'),si.due_learning_day,si.stability,si.difficulty,si.last_review_at,(SELECT r.rating FROM weakness_reviews r WHERE r.scheduler_item_id=si.id AND r.effective_status='active' ORDER BY r.reviewed_at DESC,r.id DESC LIMIT 1),(SELECT count(*) FROM weakness_reviews r WHERE r.scheduler_item_id=si.id AND r.effective_status='active'),w.first_seen,w.last_seen,w.due_date,w.interval_days,w.ease_factor,w.repetitions,w.lapses,(SELECT count(*) FROM observations o WHERE o.weakness_id=w.id AND o.effective_status='active' AND o.outcome IN ('incorrect','omitted') AND NOT EXISTS(SELECT 1 FROM unobserved_targets ut WHERE ut.session_id=o.session_id AND ut.observation_no=o.observation_no)),(SELECT count(*) FROM observations o WHERE o.weakness_id=w.id AND o.effective_status='active' AND o.outcome IN ('correct','prompted_correct')),(SELECT count(*) FROM observations o WHERE o.weakness_id=w.id AND o.effective_status='active'),(SELECT count(DISTINCT s.session_date) FROM observations o JOIN sessions s ON s.id=o.session_id WHERE o.weakness_id=w.id AND o.effective_status='active' AND o.outcome IN ('incorrect','omitted') AND NOT EXISTS(SELECT 1 FROM unobserved_targets ut WHERE ut.session_id=o.session_id AND ut.observation_no=o.observation_no)),(SELECT max(s.session_date) FROM observations o JOIN sessions s ON s.id=o.session_id WHERE o.weakness_id=w.id AND o.effective_status='active' AND o.outcome IN ('incorrect','omitted') AND NOT EXISTS(SELECT 1 FROM unobserved_targets ut WHERE ut.session_id=o.session_id AND ut.observation_no=o.observation_no)),(SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM observations bad JOIN sessions sb ON sb.id=bad.session_id WHERE bad.weakness_id=w.id AND bad.effective_status='active' AND bad.outcome IN ('incorrect','omitted') AND NOT EXISTS(SELECT 1 FROM unobserved_targets ut WHERE ut.session_id=bad.session_id AND ut.observation_no=bad.observation_no) AND sb.session_date > (SELECT max(sx.session_date) FROM observations bx JOIN sessions sx ON sx.id=bx.session_id WHERE bx.weakness_id=w.id AND bx.effective_status='active' AND bx.outcome IN ('incorrect','omitted') AND NOT EXISTS(SELECT 1 FROM unobserved_targets ut WHERE ut.session_id=bx.session_id AND ut.observation_no=bx.observation_no))) THEN 1 ELSE 0 END),COALESCE((SELECT c.key FROM weakness_concepts wc JOIN concepts c ON c.id=wc.concept_id WHERE wc.weakness_id=w.id AND wc.role='primary'),'') FROM weaknesses w LEFT JOIN scheduler_items si ON si.weakness_id=w.id AND si.track='general' ".to_owned();
     let mut vals: Vec<SqlValue> = Vec::new();
     sql.push_str(if include_nonactive {
         "WHERE 1=1"
@@ -893,7 +991,7 @@ fn observation_json(
     aid: Option<i64>,
     iid: Option<i64>,
 ) -> Result<Vec<Value>> {
-    let mut sql="SELECT w.key,w.category,o.observation_no,o.outcome,o.role,o.assessment_phase,o.hint_level,o.learner_effort,o.evidence_source,o.evidence_strength,o.severity,o.produced,o.correction,o.error_span,o.notes FROM observations o JOIN weaknesses w ON w.id=o.weakness_id WHERE o.session_id=?1".to_owned();
+    let mut sql="SELECT w.key,w.category,o.observation_no,o.outcome,o.role,o.assessment_phase,o.hint_level,o.learner_effort,o.evidence_source,o.evidence_strength,o.severity,o.produced,o.correction,o.error_span,o.notes,o.effective_status,o.revision FROM observations o JOIN weaknesses w ON w.id=o.weakness_id WHERE o.session_id=?1 AND o.effective_status='active'".to_owned();
     let bound = aid.or(iid);
     if aid.is_some() {
         sql.push_str(" AND o.attempt_id=?2")
@@ -910,7 +1008,7 @@ fn observation_json(
     };
     let mut out = Vec::new();
     while let Some(r) = rows.next()? {
-        out.push(json!({"weakness_key":r.get::<_,String>(0)?,"category":r.get::<_,String>(1)?,"observation_no":r.get::<_,i64>(2)?,"outcome":r.get::<_,String>(3)?,"role":r.get::<_,String>(4)?,"assessment_phase":r.get::<_,String>(5)?,"hint_level":r.get::<_,String>(6)?,"learner_effort":r.get::<_,Option<String>>(7)?,"evidence_source":r.get::<_,String>(8)?,"evidence_strength":r.get::<_,Option<String>>(9)?,"severity":r.get::<_,Option<String>>(10)?,"produced":r.get::<_,Option<String>>(11)?,"correction":r.get::<_,Option<String>>(12)?,"error_span":r.get::<_,Option<String>>(13)?,"notes":r.get::<_,Option<String>>(14)?}));
+        out.push(json!({"weakness_key":r.get::<_,String>(0)?,"category":r.get::<_,String>(1)?,"observation_no":r.get::<_,i64>(2)?,"outcome":r.get::<_,String>(3)?,"role":r.get::<_,String>(4)?,"assessment_phase":r.get::<_,String>(5)?,"hint_level":r.get::<_,String>(6)?,"learner_effort":r.get::<_,Option<String>>(7)?,"evidence_source":r.get::<_,String>(8)?,"evidence_strength":r.get::<_,Option<String>>(9)?,"severity":r.get::<_,Option<String>>(10)?,"produced":r.get::<_,Option<String>>(11)?,"correction":r.get::<_,Option<String>>(12)?,"error_span":r.get::<_,Option<String>>(13)?,"notes":r.get::<_,Option<String>>(14)?,"effective_status":r.get::<_,String>(15)?,"revision":r.get::<_,i64>(16)?}));
     }
     Ok(out)
 }
@@ -918,7 +1016,7 @@ fn observation_json(
 fn finding_counts_json(c: &Connection, sid: i64) -> Result<Value> {
     let mut stmt = c.prepare(
         "SELECT assessment_kind,count(*) FROM session_findings
-         WHERE session_id=?1 GROUP BY assessment_kind ORDER BY assessment_kind",
+         WHERE session_id=?1 AND effective_status='active' GROUP BY assessment_kind ORDER BY assessment_kind",
     )?;
     let mut counts = serde_json::Map::new();
     for row in stmt.query_map([sid], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))? {
@@ -931,7 +1029,7 @@ fn finding_counts_json(c: &Connection, sid: i64) -> Result<Value> {
 fn findings_json(c: &Connection, sid: i64) -> Result<Vec<Value>> {
     let mut stmt = c.prepare(
         "SELECT practice_item_id,attempt_id,assessment_kind,original,suggestion,note
-         FROM session_findings WHERE session_id=?1 ORDER BY id",
+         FROM session_findings WHERE session_id=?1 AND effective_status='active' ORDER BY id",
     )?;
     stmt.query_map([sid], |r| {
         Ok(json!({
@@ -953,6 +1051,29 @@ fn findings_json(c: &Connection, sid: i64) -> Result<Vec<Value>> {
     })?
     .collect::<rusqlite::Result<Vec<Value>>>()
     .map_err(Into::into)
+}
+
+fn bounded_findings_json(c: &Connection, sid: i64, limit: i64) -> Result<Vec<Value>> {
+    let mut stmt = c.prepare(
+        "SELECT practice_item_id,attempt_id,assessment_kind,original,suggestion,note,effective_status,revision
+         FROM session_findings WHERE session_id=?1 AND effective_status='active' ORDER BY id LIMIT ?2",
+    )?;
+    stmt.query_map(params![sid, limit], |r| {
+        Ok(json!({
+            "practice_item_no": r.get::<_, Option<i64>>(0)?.and_then(|id| c.query_row(
+                "SELECT item_no FROM practice_items WHERE id=?1 AND session_id=?2 AND effective_status='active'",
+                params![id, sid], |row| row.get::<_, i64>(0)).ok()),
+            "attempt_no": r.get::<_, Option<i64>>(1)?.and_then(|id| c.query_row(
+                "SELECT attempt_no FROM attempts WHERE id=?1 AND session_id=?2",
+                params![id, sid], |row| row.get::<_, i64>(0)).ok()),
+            "assessment_kind": r.get::<_, String>(2)?,
+            "original": r.get::<_, String>(3)?,
+            "suggestion": r.get::<_, Option<String>>(4)?,
+            "note": r.get::<_, Option<String>>(5)?,
+            "effective_status": r.get::<_, String>(6)?,
+            "revision": r.get::<_, i64>(7)?,
+        }))
+    })?.collect::<rusqlite::Result<Vec<Value>>>().map_err(Into::into)
 }
 
 fn selected_fields(value: &Value, fields: &[&str]) -> Value {
@@ -990,10 +1111,11 @@ fn compact_observations_json(
                    WHERE a.id=o.attempt_id AND a.session_id=o.session_id)
                 ),
                 (SELECT a.attempt_no FROM attempts a
-                 WHERE a.id=o.attempt_id AND a.session_id=o.session_id)
+                 WHERE a.id=o.attempt_id AND a.session_id=o.session_id),
+                o.effective_status,o.revision
          FROM observations o
          JOIN weaknesses w ON w.id=o.weakness_id
-         WHERE o.session_id=?1 ORDER BY o.observation_no",
+         WHERE o.session_id=?1 AND o.effective_status='active' ORDER BY o.observation_no",
     )?;
     let rows = stmt.query_map([sid], |r| {
         Ok((
@@ -1014,6 +1136,8 @@ fn compact_observations_json(
             r.get::<_, Option<String>>(14)?,
             r.get::<_, Option<i64>>(15)?,
             r.get::<_, Option<i64>>(16)?,
+            r.get::<_, String>(17)?,
+            r.get::<_, i64>(18)?,
         ))
     })?;
     let mut out = Vec::new();
@@ -1036,6 +1160,8 @@ fn compact_observations_json(
             notes,
             practice_item_no,
             attempt_no,
+            effective_status,
+            revision,
         ) = row?;
         let mut value = json!({
             "observation_no": observation_no,
@@ -1055,6 +1181,8 @@ fn compact_observations_json(
             "correction": correction,
             "error_span": error_span,
             "notes": notes,
+            "effective_status": effective_status,
+            "revision": revision,
         });
         if let Some(assessment) = production.and_then(|values| {
             values.iter().find(|candidate| {
@@ -1081,7 +1209,7 @@ fn compact_attempt_refs_json(c: &Connection, sid: i64) -> Result<Vec<Value>> {
     let mut stmt = c.prepare(
         "SELECT a.attempt_no,
                 (SELECT p.item_no FROM practice_items p
-                 WHERE p.id=a.practice_item_id AND p.session_id=a.session_id)
+                 WHERE p.id=a.practice_item_id AND p.session_id=a.session_id AND p.effective_status='active')
          FROM attempts a WHERE a.session_id=?1 ORDER BY a.attempt_no",
     )?;
     let rows = stmt
@@ -1125,6 +1253,7 @@ fn compact_evidence_json(c: &Connection, sid: i64) -> Result<Value> {
             "reason": "no production evidence was recorded",
             "attempts": compact_attempt_refs_json(c, sid)?,
             "observations": compact_observations_json(c, sid, None)?,
+            "findings": bounded_findings_json(c, sid, 20)?,
             "interventions": [],
             "variation_assessments": []
         }));
@@ -1135,6 +1264,7 @@ fn compact_evidence_json(c: &Connection, sid: i64) -> Result<Value> {
             "reason": "production evidence is unavailable",
             "attempts": compact_attempt_refs_json(c, sid)?,
             "observations": compact_observations_json(c, sid, None)?,
+            "findings": bounded_findings_json(c, sid, 20)?,
             "interventions": [],
             "variation_assessments": []
         }));
@@ -1242,6 +1372,7 @@ fn compact_evidence_json(c: &Connection, sid: i64) -> Result<Value> {
         "target_weakness_keys": target_keys.into_iter().collect::<Vec<_>>(),
         "attempts": attempts,
         "observations": compact_observations,
+        "findings": bounded_findings_json(c, sid, 20)?,
         "interventions": map_array("interventions", &[
             "intervention_no", "kind", "text", "target_weakness_keys",
             "after_attempt_no", "before_attempt_no"
@@ -1400,7 +1531,7 @@ fn fetch_recent_prompts(c: &Connection, wid: i64, limit: i32) -> Result<Vec<Stri
         .collect::<rusqlite::Result<Vec<_>>>()?)
 }
 fn recent_errors(c: &Connection, wid: i64) -> Result<Vec<Value>> {
-    let mut s=c.prepare("SELECT produced,correction FROM observations o WHERE weakness_id=?1 AND outcome IN ('incorrect','partially_correct','omitted') AND NOT EXISTS(SELECT 1 FROM unobserved_targets ut WHERE ut.session_id=o.session_id AND ut.observation_no=o.observation_no) AND (produced IS NOT NULL OR correction IS NOT NULL) ORDER BY id DESC LIMIT 3")?;
+    let mut s=c.prepare("SELECT produced,correction FROM observations o WHERE weakness_id=?1 AND effective_status='active' AND outcome IN ('incorrect','partially_correct','omitted') AND NOT EXISTS(SELECT 1 FROM unobserved_targets ut WHERE ut.session_id=o.session_id AND ut.observation_no=o.observation_no) AND (produced IS NOT NULL OR correction IS NOT NULL) ORDER BY id DESC LIMIT 3")?;
     Ok(s.query_map([wid],|r|Ok(json!({"produced":r.get::<_,Option<String>>(0)?,"correction":r.get::<_,Option<String>>(1)?})))?.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
@@ -1661,6 +1792,18 @@ impl LearningStore for SqliteStore {
     async fn production_action(&self, action: &str, payload: Value) -> Result<Value> {
         let c = self.conn()?;
         match action {
+            "study_plan" => crate::curriculum::plan(&c, None, None),
+            "handoff_create" => crate::workflow::create(&c, serde_json::from_value(payload)?),
+            "handoff_get" => crate::workflow::get(
+                &c,
+                &serde_json::from_value::<crate::workflow::HandoffRequest>(payload)?.handoff_id,
+            ),
+            "handoff_feedback" => crate::workflow::feedback(&c, serde_json::from_value(payload)?),
+            "handoff_repair" => crate::workflow::repair(
+                &c,
+                payload["handoff_id"].as_str().unwrap_or(""),
+                serde_json::from_value(payload["request"].clone())?,
+            ),
             "get" => crate::production::get(&c),
             "update" => crate::production::update(&c, serde_json::from_value(payload)?),
             "validate" => crate::production::validate(&c, serde_json::from_value(payload)?),
@@ -1688,7 +1831,7 @@ impl LearningStore for SqliteStore {
         let full = matches!(request.detail, Some(DetailMode::Full));
         let weaknesses=rows.into_iter().map(|r|Ok(json!({"key":r.key,"category":r.category,"description":r.description,"target_pattern":r.target_pattern,"first_seen":r.first_seen,"last_seen":r.last_seen,"classification":classification(&c,r.id,full)?,"fsrs":fsrs_json(&r,day,&cfg)?,"incorrect_count":r.incorrect_count,"correct_count":r.correct_count,"observation_count":r.observation_count,"recent_prompts":fetch_recent_prompts(&c,r.id,if full{4}else{2})?}))).collect::<Result<Vec<_>>>()?;
         let n = i32::from(request.recent_sessions.unwrap_or(5).min(20));
-        let mut s=c.prepare("SELECT id,session_date,exercise_type_key,task_ref,topic,notes,(SELECT count(*) FROM attempts a WHERE a.session_id=s.id),(SELECT count(*) FROM observations o WHERE o.session_id=s.id),(SELECT count(*) FROM practice_items p WHERE p.session_id=s.id) FROM sessions s ORDER BY session_date DESC,id DESC LIMIT ?1")?;
+        let mut s=c.prepare("SELECT id,session_date,exercise_type_key,task_ref,topic,notes,(SELECT summary_json FROM effective_summaries es WHERE es.session_id=s.id AND es.summary_key='audit_quality'),(SELECT count(*) FROM attempts a WHERE a.session_id=s.id AND (a.practice_item_id IS NULL OR EXISTS(SELECT 1 FROM practice_items p2 WHERE p2.id=a.practice_item_id AND p2.effective_status='active'))),(SELECT count(*) FROM observations o WHERE o.session_id=s.id AND o.effective_status='active'),(SELECT count(*) FROM practice_items p WHERE p.session_id=s.id AND p.effective_status='active') FROM sessions s ORDER BY session_date DESC,id DESC LIMIT ?1")?;
         let session_rows = s
             .query_map([n], |r| {
                 Ok((
@@ -1698,9 +1841,10 @@ impl LearningStore for SqliteStore {
                     r.get::<_, Option<String>>(3)?,
                     r.get::<_, Option<String>>(4)?,
                     r.get::<_, Option<String>>(5)?,
-                    r.get::<_, i64>(6)?,
+                    r.get::<_, Option<String>>(6)?,
                     r.get::<_, i64>(7)?,
                     r.get::<_, i64>(8)?,
+                    r.get::<_, i64>(9)?,
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1714,6 +1858,7 @@ impl LearningStore for SqliteStore {
                     task_ref,
                     topic,
                     notes,
+                    effective_summary,
                     attempt_count,
                     observation_count,
                     item_count,
@@ -1728,6 +1873,7 @@ impl LearningStore for SqliteStore {
                         "task_ref": task_ref,
                         "topic": topic,
                         "notes": notes,
+                        "effective_summary": effective_summary.and_then(|value| serde_json::from_str::<Value>(&value).ok()),
                         "attempt_count": attempt_count,
                         "observation_count": observation_count,
                         "item_count": item_count
@@ -1736,7 +1882,7 @@ impl LearningStore for SqliteStore {
             )
             .collect::<Result<Vec<_>>>()?;
         Ok(
-            json!({"practice_policy":crate::production::resolve(&c,None,None)?,"as_of":day.to_string(),"active_weaknesses":weaknesses,"recent_sessions":sessions,"activity_coverage":activity_coverage(&c,n)?,"scheduler":{"algorithm":cfg.algorithm,"algorithm_version":cfg.algorithm_version,"desired_retention":cfg.desired_retention,"parameter_set_id":cfg.parameter_set_id,"parameters_source":cfg.source}}),
+            json!({"practice_policy":crate::production::resolve(&c,None,None)?,"as_of":day.to_string(),"active_weaknesses":weaknesses,"recent_sessions":sessions,"activity_coverage":activity_coverage(&c,n)?,"evidence_summary":crate::audit::effective_evidence_summary(&c)?,"weekly_progress":crate::audit::weekly_progress(&c,Some(&day.to_string()))?,"exam_progress":crate::audit::exam_progress(&c)?,"scheduler":{"algorithm":cfg.algorithm,"algorithm_version":cfg.algorithm_version,"desired_retention":cfg.desired_retention,"parameter_set_id":cfg.parameter_set_id,"parameters_source":cfg.source}}),
         )
     }
 
@@ -1772,9 +1918,9 @@ impl LearningStore for SqliteStore {
         {
             bail!("from_date must not be after to_date")
         }
-        let mut sql="SELECT DISTINCT s.id,s.session_date,s.exercise_type_key,s.task_ref,s.topic,s.notes FROM sessions s WHERE 1=1".to_owned();
+        let mut sql="SELECT DISTINCT s.id,s.session_date,s.exercise_type_key,s.task_ref,s.topic,s.notes,(SELECT summary_json FROM effective_summaries es WHERE es.session_id=s.id AND es.summary_key='audit_quality') FROM sessions s WHERE 1=1".to_owned();
         let mut vals: Vec<SqlValue> = Vec::new();
-        let target_union = "(SELECT o.weakness_id FROM observations o WHERE o.session_id=s.id UNION SELECT t.weakness_id FROM practice_item_targets t JOIN practice_items p ON p.id=t.practice_item_id WHERE p.session_id=s.id)";
+        let target_union = "(SELECT o.weakness_id FROM observations o WHERE o.session_id=s.id AND o.effective_status='active' UNION SELECT t.weakness_id FROM practice_item_targets t JOIN practice_items p ON p.id=t.practice_item_id WHERE p.session_id=s.id AND p.effective_status='active')";
         if let Some(session_id) = request.session_id {
             if session_id <= 0 {
                 bail!("session_id must be positive")
@@ -1841,7 +1987,7 @@ impl LearningStore for SqliteStore {
             );
         }
         if let Some(v) = request.drill_types.as_ref().filter(|v| !v.is_empty()) {
-            sql.push_str(" AND EXISTS(SELECT 1 FROM practice_items p WHERE p.session_id=s.id AND p.drill_type IN (");
+            sql.push_str(" AND EXISTS(SELECT 1 FROM practice_items p WHERE p.session_id=s.id AND p.effective_status='active' AND p.drill_type IN (");
             sql.push_str(
                 &std::iter::repeat_n("?", v.len())
                     .collect::<Vec<_>>()
@@ -1931,12 +2077,18 @@ impl LearningStore for SqliteStore {
             vals.extend(types.into_iter().map(SqlValue::from));
         }
         if let Some(skill) = request.skill.as_deref() {
-            sql.push_str(" AND (s.exercise_type_key LIKE ? OR COALESCE(s.topic,'') LIKE ? OR EXISTS(SELECT 1 FROM observations o JOIN weaknesses w ON w.id=o.weakness_id WHERE o.session_id=s.id AND (w.key=? OR w.category=?)))");
+            sql.push_str(" AND (EXISTS(SELECT 1 FROM task_requirements t WHERE t.session_id=s.id AND t.skill=?) OR s.exercise_type_key LIKE ? OR COALESCE(s.topic,'') LIKE ? OR EXISTS(SELECT 1 FROM observations o JOIN weaknesses w ON w.id=o.weakness_id WHERE o.session_id=s.id AND o.effective_status='active' AND (w.key=? OR w.category=?)))");
             let p = format!("%{skill}%");
             vals.extend(
-                [p.clone(), p, skill.to_owned(), skill.to_owned()]
-                    .into_iter()
-                    .map(SqlValue::from),
+                [
+                    skill.to_owned(),
+                    p.clone(),
+                    p,
+                    skill.to_owned(),
+                    skill.to_owned(),
+                ]
+                .into_iter()
+                .map(SqlValue::from),
             );
         }
         sql.push_str(" ORDER BY s.session_date DESC,s.id DESC LIMIT ?");
@@ -1951,13 +2103,14 @@ impl LearningStore for SqliteStore {
                     r.get::<_, Option<String>>(3)?,
                     r.get::<_, Option<String>>(4)?,
                     r.get::<_, Option<String>>(5)?,
+                    r.get::<_, Option<String>>(6)?,
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let mut result = Vec::new();
-        for (sid, date, type_key, task_ref, topic, notes) in sessions {
+        for (sid, date, type_key, task_ref, topic, notes, effective_summary) in sessions {
             let exercise_type_key = exercise_type_from_db(&type_key)?;
-            let mut item = json!({"id":sid,"session_date":date,"exercise_type_key":exercise_type_key,"exercise_type_label":exercise_type_key.label(),"task_ref":task_ref,"topic":topic,"notes":notes,"finding_counts":finding_counts_json(&c,sid)?});
+            let mut item = json!({"id":sid,"session_date":date,"exercise_type_key":exercise_type_key,"exercise_type_label":exercise_type_key.label(),"task_ref":task_ref,"topic":topic,"notes":notes,"effective_summary":effective_summary.and_then(|value| serde_json::from_str::<Value>(&value).ok()),"finding_counts":finding_counts_json(&c,sid)?});
             let activity_types = activity_types_for_session(&c, sid)?;
             let run_count: i64 = c.query_row(
                 "SELECT count(*) FROM activity_runs WHERE session_id=?1",
@@ -1965,12 +2118,12 @@ impl LearningStore for SqliteStore {
                 |r| r.get(0),
             )?;
             let item_count: i64 = c.query_row(
-                "SELECT count(*) FROM practice_items WHERE session_id=?1",
+                "SELECT count(*) FROM practice_items WHERE session_id=?1 AND effective_status='active'",
                 [sid],
                 |r| r.get(0),
             )?;
             let attempt_count: i64 = c.query_row(
-                "SELECT count(*) FROM attempts WHERE session_id=?1",
+                "SELECT count(*) FROM attempts WHERE session_id=?1 AND (practice_item_id IS NULL OR EXISTS(SELECT 1 FROM practice_items p WHERE p.id=attempts.practice_item_id AND p.effective_status='active'))",
                 [sid],
                 |r| r.get(0),
             )?;
@@ -1978,13 +2131,21 @@ impl LearningStore for SqliteStore {
             item["activity_run_count"] = json!(run_count);
             item["item_count"] = json!(item_count);
             item["attempt_count"] = json!(attempt_count);
+            item["task_evidence"] = crate::curriculum::session_evidence(&c, sid)?;
+            item["tutor_handoffs"] = json!(
+                c.prepare(
+                    "SELECT id FROM tutor_handoffs WHERE session_id=?1 ORDER BY created_at LIMIT 20"
+                )?
+                .query_map([sid], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+            );
             item["total_measured_duration_milliseconds"] =
                 json!(session_measured_duration(&c, sid)?);
             if include_items || include_attempts {
                 item["activity_runs"] = json!(activity_runs_json(&c, sid)?);
             }
             if include_items {
-                let mut q=c.prepare("SELECT id,item_no,drill_type,prompt,response,corrected_response,reference_answer,feedback,outcome,activity_run_id,item_phase FROM practice_items WHERE session_id=?1 ORDER BY item_no")?;
+                let mut q=c.prepare("SELECT id,item_no,drill_type,prompt,response,corrected_response,reference_answer,feedback,outcome,activity_run_id,item_phase,effective_status,revision,computed_word_count,word_counter_version FROM practice_items WHERE session_id=?1 AND effective_status='active' ORDER BY item_no")?;
                 let mut arr = Vec::new();
                 for row in q.query_map([sid], |r| {
                     Ok((
@@ -1999,6 +2160,10 @@ impl LearningStore for SqliteStore {
                         r.get::<_, Option<String>>(8)?,
                         r.get::<_, Option<i64>>(9)?,
                         r.get::<_, String>(10)?,
+                        r.get::<_, String>(11)?,
+                        r.get::<_, i64>(12)?,
+                        r.get::<_, Option<i64>>(13)?,
+                        r.get::<_, Option<String>>(14)?,
                     ))
                 })? {
                     let (
@@ -2013,9 +2178,13 @@ impl LearningStore for SqliteStore {
                         outcome,
                         run_id,
                         phase,
+                        effective_status,
+                        revision,
+                        computed_word_count,
+                        word_counter_version,
                     ) = row?;
                     let targets:Vec<String>=c.prepare("SELECT w.key FROM practice_item_targets t JOIN weaknesses w ON w.id=t.weakness_id WHERE t.practice_item_id=?1 ORDER BY w.key")?.query_map([iid],|r|r.get(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
-                    let mut v = json!({"item_no":no,"drill_type":drill,"prompt":prompt,"prompt_fingerprint":c.query_row("SELECT prompt_fingerprint FROM practice_items WHERE id=?1",[iid],|r|r.get::<_,Option<String>>(0))?,"response":response,"corrected_response":corrected,"reference_answer":reference,"feedback":feedback,"outcome":outcome,"activity_run_no":run_id.and_then(|id|c.query_row("SELECT run_no FROM activity_runs WHERE id=?1",[id],|r|r.get::<_,i64>(0)).ok()),"item_phase":phase,"target_weakness_keys":targets});
+                    let mut v = json!({"item_no":no,"drill_type":drill,"prompt":prompt,"prompt_fingerprint":c.query_row("SELECT prompt_fingerprint FROM practice_items WHERE id=?1",[iid],|r|r.get::<_,Option<String>>(0))?,"response":response,"corrected_response":corrected,"reference_answer":reference,"feedback":feedback,"outcome":outcome,"activity_run_no":run_id.and_then(|id|c.query_row("SELECT run_no FROM activity_runs WHERE id=?1",[id],|r|r.get::<_,i64>(0)).ok()),"item_phase":phase,"effective_status":effective_status,"revision":revision,"computed_word_count":computed_word_count,"word_counter_version":word_counter_version,"target_weakness_keys":targets});
                     if include_observations {
                         v["observations"] = json!(observation_json(&c, sid, None, Some(iid))?);
                     }
@@ -2024,7 +2193,7 @@ impl LearningStore for SqliteStore {
                 item["items"] = json!(arr);
             }
             if include_attempts {
-                let mut q=c.prepare("SELECT id,attempt_no,practice_item_id,transcript,target_duration_seconds,actual_duration_milliseconds,response_mode,response_latency_milliseconds,timing_source,created_at FROM attempts WHERE session_id=?1 ORDER BY attempt_no")?;
+                let mut q=c.prepare("SELECT id,attempt_no,practice_item_id,transcript,target_duration_seconds,actual_duration_milliseconds,response_mode,response_latency_milliseconds,timing_source,created_at FROM attempts WHERE session_id=?1 AND (practice_item_id IS NULL OR EXISTS(SELECT 1 FROM practice_items p WHERE p.id=attempts.practice_item_id AND p.effective_status='active')) ORDER BY attempt_no")?;
                 let mut arr = Vec::new();
                 for row in q.query_map([sid], |r| {
                     Ok((
@@ -2078,7 +2247,9 @@ impl LearningStore for SqliteStore {
             }
             result.push(item)
         }
-        Ok(json!({"repetition":crate::production::repetition_summary(&result),"items":result}))
+        Ok(
+            json!({"repetition":crate::production::repetition_summary(&result),"items":result,"evidence_summary":crate::audit::effective_evidence_summary(&c)?}),
+        )
     }
 
     async fn record_practice(
@@ -2269,13 +2440,51 @@ impl LearningStore for SqliteStore {
         }
         let mut item_ids = HashMap::new();
         for item in &x.items {
-            tx.execute("INSERT INTO practice_items(session_id,item_no,drill_type,prompt,prompt_fingerprint,response,corrected_response,reference_answer,feedback,outcome,activity_run_id,item_phase) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",params![sid,item.item_no,item.drill_type.as_str(),item.prompt,prompt_fingerprint(&item.prompt),item.response,item.corrected_response,item.reference_answer,item.feedback,item.outcome.as_ref().map(serialize_enum).transpose()?,item.activity_run_no.and_then(|no|run_ids.get(&no)).copied(),item.item_phase.unwrap_or(crate::model::ActivityItemPhase::Initial).as_str()])?;
+            tx.execute("INSERT INTO practice_items(session_id,item_no,drill_type,prompt,prompt_fingerprint,response,corrected_response,reference_answer,feedback,outcome,activity_run_id,item_phase,computed_word_count,word_counter_version) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",params![sid,item.item_no,item.drill_type.as_str(),item.prompt,prompt_fingerprint(&item.prompt),item.response,item.corrected_response,item.reference_answer,item.feedback,item.outcome.as_ref().map(serialize_enum).transpose()?,item.activity_run_no.and_then(|no|run_ids.get(&no)).copied(),item.item_phase.unwrap_or(crate::model::ActivityItemPhase::Initial).as_str(),item.response.as_deref().map(crate::audit::word_count).map(|count| i64::try_from(count).map_err(|error| anyhow!(error))).transpose()?,item.response.as_ref().map(|_| crate::audit::word_counter_version())])?;
             let iid = tx.last_insert_rowid();
             item_ids.insert(item.item_no, iid);
             for key in &item.target_weakness_keys {
                 promote_target_if_needed(&tx, key)?;
                 tx.execute("INSERT INTO practice_item_targets(practice_item_id,weakness_id) SELECT ?1,id FROM weaknesses WHERE key=?2",params![iid,key])?;
             }
+        }
+        for requirement in &x.task_requirements {
+            let practice_item_id = requirement
+                .practice_item_no
+                .and_then(|number| item_ids.get(&number).copied());
+            if let (Some(item_id), Some(expected_hash)) =
+                (practice_item_id, requirement.prompt_hash.as_deref())
+            {
+                let actual: String = tx.query_row(
+                    "SELECT prompt_fingerprint FROM practice_items WHERE id=?1 AND session_id=?2",
+                    params![item_id, sid],
+                    |row| row.get(0),
+                )?;
+                if actual != expected_hash {
+                    return Err(RecordPracticeError::invalid(format!(
+                        "task requirement prompt_hash does not match item {}",
+                        requirement.practice_item_no.unwrap_or_default()
+                    )));
+                }
+            }
+            tx.execute(
+                "INSERT INTO task_requirements(session_id,practice_item_id,exam_key,specification_version,skill,task_key,prompt_hash,requested_points_json,word_min,word_max,time_budget_seconds,preparation_budget_seconds,source) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                params![
+                    sid,
+                    practice_item_id,
+                    requirement.exam_key,
+                    requirement.specification_version,
+                    requirement.skill,
+                    requirement.task_key,
+                    requirement.prompt_hash,
+                    serde_json::to_string(&requirement.requested_points)?,
+                    requirement.word_min,
+                    requirement.word_max,
+                    requirement.time_budget_seconds,
+                    requirement.preparation_budget_seconds,
+                    requirement.source.as_str(),
+                ],
+            )?;
         }
         let mut attempt_ids = HashMap::new();
         let mut observation_ids = HashMap::new();
@@ -2299,6 +2508,25 @@ impl LearningStore for SqliteStore {
             for o in &a.observations {
                 insert_observation(&tx, sid, Some(aid), iid, o, &mut observation_ids)?;
             }
+        }
+        for assessment in &x.requested_point_assessments {
+            let attempt_id = *attempt_ids
+                .get(&assessment.attempt_no)
+                .ok_or_else(|| anyhow!("requested point assessment references unknown attempt"))?;
+            tx.execute(
+                "INSERT INTO requested_point_assessments(attempt_id,point_key,status,supporting_excerpt,reason,evaluator,rubric_version,assessed_at,retrospective) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                params![
+                    attempt_id,
+                    assessment.point_key,
+                    assessment.status.as_str(),
+                    assessment.supporting_excerpt,
+                    assessment.reason,
+                    assessment.evaluator,
+                    assessment.rubric_version,
+                    assessment.assessed_at.as_deref().unwrap_or(&reviewed_at),
+                    assessment.retrospective,
+                ],
+            )?;
         }
         for item in &x.items {
             for o in &item.observations {
@@ -2494,13 +2722,37 @@ impl LearningStore for SqliteStore {
         rows.truncate(n.clamp(1, 50) as usize);
         let items=rows.iter().map(|r|Ok(json!({"key":r.key,"category":r.category,"description":r.description,"target_pattern":r.target_pattern,"classification":classification(&c,r.id,false)?,"due_learning_day":r.due,"is_due":is_due(r,day),"status":if r.due.is_none(){"new"}else if is_due(r,day){"due"}else{"upcoming"},"days_overdue":r.due.as_ref().and_then(|d|valid_date(d,"due_learning_day").ok()).map(|d|(day-d).num_days().max(0)).unwrap_or(0),"retrievability":row_retrievability(r,day,&cfg)?,"stability":r.stability,"difficulty":r.difficulty,"last_reviewed_at":r.last_review,"last_rating":r.last_rating.map(rating_name),"review_count":r.review_count,"legacy":{"due_date":r.legacy_due,"interval_days":r.legacy_interval,"ease_factor":r.legacy_ease,"repetitions":r.legacy_repetitions,"lapses":r.legacy_lapses}}))).collect::<Result<Vec<_>>>()?;
         Ok(
-            json!({"basis":"FSRS due date followed by deterministic historical onboarding priority for uninitialized targets","as_of":day.to_string(),"includes_upcoming":include_upcoming,"items":items}),
+            json!({"basis":"FSRS due date followed by deterministic historical onboarding priority for uninitialized targets","as_of":day.to_string(),"includes_upcoming":include_upcoming,"items":items,"evidence_summary":crate::audit::effective_evidence_summary(&c)?,"exam_progress":crate::audit::exam_progress(&c)?}),
         )
     }
 
     async fn practice_brief(&self, mut request: PracticeBriefRequest) -> Result<Value> {
         let c = self.conn()?;
+        if request.task_first == Some(true)
+            && (request.activity_type.is_some()
+                || request.weakness_keys.is_some()
+                || request.categories.is_some()
+                || request.concept_keys.is_some()
+                || request.scheme_keys.is_some()
+                || request.collection_keys.is_some()
+                || request.target_types.is_some()
+                || request.drill_mix.is_some()
+                || request.allowed_drill_types.is_some())
+        {
+            bail!("task_first selects complete tasks; omit drill, activity and weakness filters")
+        }
         let policy = crate::production::constrain(&c, &mut request)?;
+        if (request.task_first == Some(true)
+            || request.exam_task.is_some_and(|task| {
+                !matches!(
+                    task,
+                    crate::model::ExamTask::Reading | crate::model::ExamTask::Listening
+                )
+            }))
+            && policy["conflicts"].as_array().is_some_and(Vec::is_empty)
+        {
+            return crate::curriculum::exam_brief(&c, &request, policy);
+        }
         if policy
             .get("conflicts")
             .and_then(Value::as_array)
@@ -2855,6 +3107,9 @@ impl LearningStore for SqliteStore {
         for (key, value) in policy_object {
             response[key] = value.clone();
         }
+        response["exam_progress"] = crate::audit::exam_progress(&c)?;
+        response["evidence_summary"] = crate::audit::effective_evidence_summary(&c)?;
+        response["weekly_progress"] = crate::audit::weekly_progress(&c, Some(&day.to_string()))?;
         if spontaneous {
             let opportunities=targets.iter().map(|t|json!({"weakness_key":t["weakness_key"],"communicative_function":t["communicative_function"],"elicitation_requirement":"optional","selection_reason":t["selection_reason"]})).collect::<Vec<_>>();
             response["target_opportunities"] = json!(opportunities);
@@ -2951,8 +3206,14 @@ impl LearningStore for SqliteStore {
         let count = |table: &str| -> Result<i64> {
             Ok(c.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))?)
         };
+        let effective_status = json!({
+            "active_observations": c.query_row("SELECT count(*) FROM observations WHERE effective_status='active'", [], |r| r.get::<_, i64>(0))?,
+            "retracted_observations": c.query_row("SELECT count(*) FROM observations WHERE effective_status='retracted'", [], |r| r.get::<_, i64>(0))?,
+            "active_findings": c.query_row("SELECT count(*) FROM session_findings WHERE effective_status='active'", [], |r| r.get::<_, i64>(0))?,
+            "invalidated_reviews": c.query_row("SELECT count(*) FROM weakness_reviews WHERE effective_status='invalidated'", [], |r| r.get::<_, i64>(0))?,
+        });
         Ok(
-            json!({"schema_version":schema_version,"storage_model":"single_learner","spaced_repetition":true,"scheduler":{"algorithm":cfg.algorithm,"algorithm_version":cfg.algorithm_version,"desired_retention":cfg.desired_retention,"parameter_set_id":cfg.parameter_set_id,"parameters_source":cfg.source},"last_session_date":c.query_row("SELECT max(session_date) FROM sessions",[],|r|r.get::<_,Option<String>>(0))?,"counts":{"sessions":count("sessions")?,"practice_items":count("practice_items")?,"attempts":count("attempts")?,"observations":count("observations")?,"weaknesses":count("weaknesses")?,"active_weaknesses":c.query_row("SELECT count(*) FROM weaknesses WHERE target_status='active'",[],|r|r.get::<_,i64>(0))?,"scheduler_items":count("scheduler_items")?,"weakness_reviews":count("weakness_reviews")?,"review_observations":count("review_observations")?,"activity_runs":count("activity_runs")?,"activity_stimuli":count("activity_stimuli")?,"attempt_reflections":count("attempt_reflections")?,"session_findings":count("session_findings")?}}),
+            json!({"schema_version":schema_version,"storage_model":"single_learner","spaced_repetition":true,"scheduler":{"algorithm":cfg.algorithm,"algorithm_version":cfg.algorithm_version,"desired_retention":cfg.desired_retention,"parameter_set_id":cfg.parameter_set_id,"parameters_source":cfg.source},"last_session_date":c.query_row("SELECT max(session_date) FROM sessions",[],|r|r.get::<_,Option<String>>(0))?,"counts":{"sessions":count("sessions")?,"practice_items":count("practice_items")?,"attempts":count("attempts")?,"observations":count("observations")?,"weaknesses":count("weaknesses")?,"active_weaknesses":c.query_row("SELECT count(*) FROM weaknesses WHERE target_status='active'",[],|r|r.get::<_,i64>(0))?,"scheduler_items":count("scheduler_items")?,"weakness_reviews":count("weakness_reviews")?,"review_observations":count("review_observations")?,"activity_runs":count("activity_runs")?,"activity_stimuli":count("activity_stimuli")?,"attempt_reflections":count("attempt_reflections")?,"session_findings":count("session_findings")?},"effective_data":effective_status,"evidence_summary":crate::audit::effective_evidence_summary(&c)?,"weekly_progress":crate::audit::weekly_progress(&c,None)?,"exam_progress":crate::audit::exam_progress(&c)?}),
         )
     }
     async fn ping(&self) -> Result<()> {
@@ -3671,7 +3932,7 @@ impl LearningStore for MockStore {
     }
     async fn data_status(&self) -> Result<Value> {
         Ok(
-            json!({"schema_version":12,"status":"ready","counts":{"activity_runs":0,"activity_stimuli":0,"attempt_reflections":0,"session_findings":0}}),
+            json!({"schema_version":13,"status":"ready","counts":{"activity_runs":0,"activity_stimuli":0,"attempt_reflections":0,"session_findings":0},"effective_data":{"active_observations":0,"retracted_observations":0,"active_findings":0,"invalidated_reviews":0}}),
         )
     }
     async fn ping(&self) -> Result<()> {
@@ -3884,6 +4145,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn task_requirements_and_point_assessments_keep_objective_facts_separate() {
+        let store = test_store();
+        let request: RecordPracticeSessionRequest = serde_json::from_value(json!({
+            "idempotency_key": "task-facts-round-trip",
+            "exercise_type_key": "production_drill",
+            "items": [{
+                "item_no": 1,
+                "drill_type": "micro_story",
+                "prompt": "Escribe una respuesta breve.",
+                "response": "Hola, mundo."
+            }],
+            "attempts": [{
+                "attempt_no": 1,
+                "practice_item_no": 1,
+                "transcript": "Hola, mundo.",
+                "response_mode": "typed"
+            }],
+            "task_requirements": [{
+                "practice_item_no": 1,
+                "exam_key": "dele_a2",
+                "specification_version": "2022-guide-v2020",
+                "skill": "writing",
+                "task_key": "writing_task_2",
+                "requested_points": ["place"],
+                "word_min": 70,
+                "word_max": 80,
+                "time_budget_seconds": 2700,
+                "source": "official"
+            }],
+            "requested_point_assessments": [{
+                "attempt_no": 1,
+                "point_key": "writing_task_2.place",
+                "status": "partial",
+                "reason": "The response names the place but omits the requested detail.",
+                "evaluator": "tutor",
+                "retrospective": false
+            }]
+        }))
+        .unwrap();
+        store.record_practice(request).await.unwrap();
+        let c = store.conn().unwrap();
+        assert_eq!(
+            c.query_row("SELECT count(*) FROM task_requirements", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            c.query_row("SELECT status FROM requested_point_assessments", [], |r| {
+                r.get::<_, String>(0)
+            })
+            .unwrap(),
+            "partial"
+        );
+        assert_eq!(
+            c.query_row("SELECT computed_word_count FROM practice_items", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap(),
+            2
+        );
+    }
+
+    #[tokio::test]
     async fn activity_recording_and_full_recent_output_round_trip() {
         let store = test_store();
         let payload = json!({
@@ -3989,6 +4314,7 @@ mod tests {
         for spec in crate::activities::activity_catalog() {
             let brief = store
                 .practice_brief(PracticeBriefRequest {
+                    task_first: None,
                     practice_mode: None,
                     session_overrides: None,
                     count: None,
@@ -4008,6 +4334,7 @@ mod tests {
                     activity_type: Some(spec.activity_type),
                     planned_duration_seconds: None,
                     activity_config: None,
+                    exam_task: None,
                 })
                 .await
                 .unwrap();

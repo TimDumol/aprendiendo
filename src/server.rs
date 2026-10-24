@@ -373,6 +373,48 @@ impl LearningServer {
     }
 
     #[tool(
+        name = "get_tutor_handoff",
+        description = "Open a learner-created tutor handoff by its exact handoff_id. Returns the frozen original prompts, attempt numbers, transcripts, task requirements and any saved feedback/repairs. Coach this source without duplicating its recorded session. Transcript evidence cannot establish pronunciation or measured fluency.",
+        annotations(
+            title = "Open tutor handoff",
+            read_only_hint = true,
+            destructive_hint = false,
+            open_world_hint = false
+        )
+    )]
+    pub async fn get_tutor_handoff(
+        &self,
+        Parameters(request): Parameters<crate::workflow::HandoffRequest>,
+    ) -> Result<Json<DomainResult>, String> {
+        self.store
+            .production_action("handoff_get", serde_json::json!(request))
+            .await
+            .map(Self::domain)
+            .map_err(|e| Self::operation_error("get_tutor_handoff", e))
+    }
+
+    #[tool(
+        name = "record_tutor_feedback",
+        description = "Return tutor feedback to an existing learner-created handoff. Open get_tutor_handoff first; use exact attempt_no and verbatim excerpts. Assess requested points and communication, then at most two consequential repairs with hints and suggested corrections. Feedback is immutable and idempotent; use the identical payload/key for uncertain retries. Does not duplicate the session, change original attempts, create weaknesses or update FSRS. The learner can open feedback and save assisted repairs in the app.",
+        annotations(
+            title = "Return tutor feedback",
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = false
+        )
+    )]
+    pub async fn record_tutor_feedback(
+        &self,
+        Parameters(request): Parameters<crate::workflow::TutorFeedback>,
+    ) -> Result<Json<DomainResult>, String> {
+        self.store
+            .production_action("handoff_feedback", serde_json::json!(request))
+            .await
+            .map(Self::domain)
+            .map_err(|e| Self::operation_error("record_tutor_feedback", e))
+    }
+
+    #[tool(
         name = "get_recent_practice",
         description = "Read recent practice when needed for context or feedback. Reuse information already returned by get_practice_brief or a recording response; do not require this read before recording. Use session_id for one exact session, or task_ref with limit=1 for the immediately preceding related task. Use detail=evidence for a compact evidence view retaining outcomes, hints/corrections, exposure, independence metadata and source references without raw attempt payloads.",
         annotations(
@@ -444,7 +486,7 @@ impl LearningServer {
 
     #[tool(
         name = "get_practice_brief",
-        description = "Normal tutoring context: reuse the returned known weakness keys and policy version, keep target wording private, and validate each delivered prompt before the learner responds.",
+        description = "Normal tutoring context: for what to practice next set task_first=true to use the same task planner as the app; use exam_task to narrow the task scope. For an explicitly requested drill omit task_first. Reuse the returned known weakness keys and policy version, keep target wording private, and validate each delivered prompt before the learner responds.",
         annotations(
             title = "Get practice brief",
             read_only_hint = true,
@@ -947,7 +989,7 @@ impl ServerHandler for LearningServer {
     }
 
     fn get_info(&self) -> ServerInfo {
-        let mut info=ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions("Use these tools only for the configured single-learner Spanish database. Normal tutoring: get_practice_brief, validate each communicative prompt before delivery, then record the completed session once with record_tutoring_session when its generic turns/attempts shape is sufficient. Reuse the brief's known weakness keys and policy version. Put separate turns and retries in that one request; preserve actual prompts, answers, hints, retry order, effort, exposure and timing facts without inference. Declare only genuinely new weaknesses in new_weaknesses; an incidental discovery stays a candidate when activation is omitted. Keep stylistic suggestions and accepted regional alternatives in findings, feedback or notes; they are not weakness observations. Do not call upserts, taxonomy edits, or confirmation reads before ordinary recording. Only propose supported reviews; zero schedule changes is valid. Inspect the recording response and retry uncertain writes with the identical request and idempotency key. Use record_practice_session for advanced canonical workflows, including activity runs, until compact support covers them. get_learning_context, get_recent_practice and get_review_queue are read-when-needed context tools; do not require all three before recording. Preference reads/updates are for inspection or learner-requested changes. get_taxonomy and get_data_status are occasional diagnostics. Spoken responses are stored as transcripts only; timing and hesitation data must be explicitly reported or externally measured. Never ask for project IDs, database names, tables, schemas, or SQL.");
+        let mut info=ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions("Use these tools only for the configured single-learner Spanish database. For next-task recommendations use get_practice_brief with task_first=true, which shares the app planner; get the selected exam_task-scoped brief before delivery. For an existing connected handoff use get_tutor_handoff and record_tutor_feedback, without duplicating the session. Normal tutoring: get_practice_brief, validate each communicative prompt before delivery, then record the completed session once with record_tutoring_session when its generic turns/attempts shape is sufficient. Reuse the brief's known weakness keys and policy version. Put separate turns and retries in that one request; preserve actual prompts, answers, hints, retry order, effort, exposure and timing facts without inference. Declare only genuinely new weaknesses in new_weaknesses; an incidental discovery stays a candidate when activation is omitted. Keep stylistic suggestions and accepted regional alternatives in findings, feedback or notes; they are not weakness observations. Do not call upserts, taxonomy edits, or confirmation reads before ordinary recording. Only propose supported reviews; zero schedule changes is valid. Inspect the recording response and retry uncertain writes with the identical request and idempotency key. Use record_practice_session for advanced canonical workflows, including activity runs, until compact support covers them. get_learning_context, get_recent_practice and get_review_queue are read-when-needed context tools; do not require all three before recording. Preference reads/updates are for inspection or learner-requested changes. get_taxonomy and get_data_status are occasional diagnostics. Spoken responses are stored as transcripts only; timing and hesitation data must be explicitly reported or externally measured. Never ask for project IDs, database names, tables, schemas, or SQL.");
         info.server_info = Implementation::new("aprendiendo-mcp", env!("CARGO_PKG_VERSION"))
             .with_title("Aprendiendo Español")
             .with_description("Project-scoped Spanish learning history and FSRS weakness tools");
@@ -985,7 +1027,7 @@ mod tests {
             .into_iter()
             .map(|t| t.name.into_owned())
             .collect::<Vec<_>>();
-        assert_eq!(names.len(), 13);
+        assert_eq!(names.len(), 15);
         assert!(names.contains(&"get_practice_brief".to_owned()));
     }
 

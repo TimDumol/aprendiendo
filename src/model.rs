@@ -967,9 +967,120 @@ pub enum DrillMix {
     Custom,
 }
 
+/// A scoped official DELE task constraint.  It is intentionally separate from
+/// the learner's generic sentence budget and never implies that a practice
+/// result is an official exam score.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExamTask {
+    Reading,
+    Listening,
+    FullWriting,
+    #[serde(rename = "writing_task_1", alias = "writing_task1")]
+    WritingTask1,
+    #[serde(rename = "writing_task_2", alias = "writing_task2")]
+    WritingTask2,
+    FullOral,
+    #[serde(rename = "oral_task_1", alias = "oral_task1")]
+    OralTask1,
+    #[serde(rename = "oral_task_2", alias = "oral_task2")]
+    OralTask2,
+    #[serde(rename = "oral_task_3", alias = "oral_task3")]
+    OralTask3,
+}
+
+impl ExamTask {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Reading => "reading",
+            Self::Listening => "listening",
+            Self::FullWriting => "full_writing",
+            Self::WritingTask1 => "writing_task_1",
+            Self::WritingTask2 => "writing_task_2",
+            Self::FullOral => "full_oral",
+            Self::OralTask1 => "oral_task_1",
+            Self::OralTask2 => "oral_task_2",
+            Self::OralTask3 => "oral_task_3",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskRequirementSource {
+    Official,
+    TeacherCreated,
+    Micropractice,
+}
+
+impl TaskRequirementSource {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Official => "official",
+            Self::TeacherCreated => "teacher_created",
+            Self::Micropractice => "micropractice",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestedPointStatus {
+    Met,
+    Partial,
+    Missing,
+    Unclear,
+}
+
+impl RequestedPointStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Met => "met",
+            Self::Partial => "partial",
+            Self::Missing => "missing",
+            Self::Unclear => "unclear",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TaskRequirementInput {
+    pub practice_item_no: Option<u16>,
+    pub exam_key: Option<String>,
+    pub specification_version: Option<String>,
+    pub skill: String,
+    pub task_key: String,
+    pub prompt_hash: Option<String>,
+    #[serde(default)]
+    pub requested_points: Vec<String>,
+    pub word_min: Option<u16>,
+    pub word_max: Option<u16>,
+    pub time_budget_seconds: Option<u32>,
+    pub preparation_budget_seconds: Option<u32>,
+    pub source: TaskRequirementSource,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RequestedPointAssessmentInput {
+    pub attempt_no: u16,
+    pub point_key: String,
+    pub status: RequestedPointStatus,
+    pub supporting_excerpt: Option<String>,
+    pub reason: Option<String>,
+    pub evaluator: String,
+    pub rubric_version: Option<String>,
+    pub assessed_at: Option<String>,
+    #[serde(default)]
+    pub retrospective: bool,
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PracticeBriefRequest {
+    /// Select the next complete task using the shared app planner. Omit activity/weakness filters; use exam_task to narrow the scope.
+    pub task_first: Option<bool>,
     pub practice_mode: Option<crate::production::PracticeMode>,
     pub session_overrides: Option<crate::production::SessionOverride>,
     pub count: Option<u16>,
@@ -989,6 +1100,9 @@ pub struct PracticeBriefRequest {
     pub activity_type: Option<ActivityType>,
     pub planned_duration_seconds: Option<u32>,
     pub activity_config: Option<ActivityConfigInput>,
+    /// Optional official DELE task scope. When present it overrides only the
+    /// scoped micropractice constraints and is included in the response.
+    pub exam_task: Option<ExamTask>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
@@ -1087,6 +1201,14 @@ pub struct RecordPracticeSessionRequest {
     #[schemars(length(max = 10))]
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub activity_runs: Vec<ActivityRunInput>,
+    /// Explicit task facts are persisted separately from the learner answer.
+    #[schemars(length(max = 100))]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub task_requirements: Vec<TaskRequirementInput>,
+    /// Requested points are assessed against a named attempt and may be partial or unclear.
+    #[schemars(length(max = 300))]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requested_point_assessments: Vec<RequestedPointAssessmentInput>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]

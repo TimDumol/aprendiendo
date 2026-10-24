@@ -48,6 +48,22 @@ fn canonical_fixture() -> RecordPracticeSessionRequest {
     serde_json::from_str(include_str!("../examples/tutoring-canonical-session.json")).unwrap()
 }
 
+#[test]
+fn compact_exam_assessment_resolves_retry_reference() {
+    let request = serde_json::from_value(json!({
+        "idempotency_key":"exam-reference", "exercise_type_key":"production_drill",
+        "turns":[
+            {"drill_type":"micro_story","prompt":"Escribe.","attempts":[{"transcript":"Uno."},{"transcript":"Dos."}]},
+            {"drill_type":"micro_story","prompt":"Otra tarea.","attempts":[{"transcript":"Tres."}]}
+        ],
+        "task_requirements":[{"practice_item_no":2,"skill":"writing","task_key":"writing_task_2","source":"teacher_created","requested_points":["place"]}],
+        "task_assessments":[{"attempt":{"turn":2,"attempt":1},"point_key":"place","status":"missing","evaluator":"tutor","reason":"No location given."}]
+    })).unwrap();
+    let expanded = aprendiendo_mcp::tutoring::expand(request).unwrap();
+    assert_eq!(expanded.task_requirements[0].practice_item_no, Some(2));
+    assert_eq!(expanded.requested_point_assessments[0].attempt_no, 3);
+}
+
 fn count(path: &std::path::Path, table: &str) -> i64 {
     let connection = Connection::open(path).unwrap();
     connection

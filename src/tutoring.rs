@@ -218,6 +218,14 @@ pub struct TutoringReviewInput {
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RecordTutoringSessionRequest {
+    /// Item numbers refer to the one-based turns array.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(length(max = 100))]
+    pub task_requirements: Vec<crate::model::TaskRequirementInput>,
+    /// Explicit turn/attempt references avoid counting flattened retries by hand.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(length(max = 300))]
+    pub task_assessments: Vec<TutoringTaskAssessment>,
     /// Required nonblank key. Exact retries expand to the same canonical
     /// request and replay the existing ledger response.
     #[schemars(length(min = 1))]
@@ -256,6 +264,18 @@ pub struct RecordTutoringSessionRequest {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(length(max = 100))]
     pub reviews: Vec<TutoringReviewInput>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TutoringTaskAssessment {
+    pub attempt: TutoringAttemptReference,
+    pub point_key: String,
+    pub status: crate::model::RequestedPointStatus,
+    pub supporting_excerpt: Option<String>,
+    pub reason: Option<String>,
+    pub evaluator: String,
+    pub rubric_version: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -366,6 +386,8 @@ pub fn expand(
     request: RecordTutoringSessionRequest,
 ) -> Result<RecordPracticeSessionRequest, String> {
     let RecordTutoringSessionRequest {
+        task_requirements,
+        task_assessments,
         idempotency_key,
         exercise_type_key,
         session_date,
@@ -623,13 +645,9 @@ pub fn expand(
 
     for (turn_index, turn) in turns.iter().enumerate() {
         for (attempt_index, attempt) in turn.attempts.iter().enumerate() {
-            let meta = metas
-                .get(&(turn_index, attempt_index))
-                .ok_or_else(|| {
-                    format!(
-                        "turns[{turn_index}].attempts[{attempt_index}] is missing attempt metadata"
-                    )
-                })?;
+            let meta = metas.get(&(turn_index, attempt_index)).ok_or_else(|| {
+                format!("turns[{turn_index}].attempts[{attempt_index}] is missing attempt metadata")
+            })?;
             let mut canonical_observations = Vec::with_capacity(attempt.observations.len());
             let mut reflections = Vec::new();
             if let Some(evidence) = &attempt.evidence
@@ -875,6 +893,34 @@ pub fn expand(
         None
     };
 
+    let mut requested_point_assessments = Vec::new();
+    for assessment in task_assessments {
+        let turn = checked_index(
+            assessment.attempt.turn,
+            turns.len(),
+            "task_assessments.attempt.turn",
+        )?;
+        let attempt = checked_index(
+            assessment.attempt.attempt,
+            turns[turn].attempts.len(),
+            "task_assessments.attempt.attempt",
+        )?;
+        let number = metas
+            .get(&(turn, attempt))
+            .ok_or("task assessment attempt unavailable")?
+            .attempt_no;
+        requested_point_assessments.push(crate::model::RequestedPointAssessmentInput {
+            attempt_no: number,
+            point_key: assessment.point_key,
+            status: assessment.status,
+            supporting_excerpt: assessment.supporting_excerpt,
+            reason: assessment.reason,
+            evaluator: assessment.evaluator,
+            rubric_version: assessment.rubric_version,
+            assessed_at: None,
+            retrospective: false,
+        });
+    }
     Ok(RecordPracticeSessionRequest {
         production_evidence,
         idempotency_key,
@@ -891,5 +937,7 @@ pub fn expand(
         findings: canonical_findings,
         reviews: canonical_reviews,
         activity_runs: Vec::new(),
+        task_requirements,
+        requested_point_assessments,
     })
 }

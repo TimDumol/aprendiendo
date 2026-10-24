@@ -574,6 +574,7 @@ pub fn router(database_path: impl AsRef<Path>) -> Result<Router> {
         provider,
     };
     Ok(Router::new()
+        .route("/api/practice/v1/auth-check", get(auth_check))
         .route("/api/practice/v1/uploads", post(create_upload))
         .route(
             "/api/practice/v1/uploads/{upload_id}/content",
@@ -592,6 +593,10 @@ pub fn router(database_path: impl AsRef<Path>) -> Result<Router> {
         )
         .layer(DefaultBodyLimit::max(MAX_UPLOAD_BODY_BYTES))
         .with_state(state))
+}
+
+async fn auth_check() -> Json<Value> {
+    Json(json!({ "status": "ok" }))
 }
 
 #[derive(Debug, Deserialize, Serialize)]

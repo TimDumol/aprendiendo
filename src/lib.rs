@@ -1,4 +1,5 @@
 pub mod activities;
+pub mod audit;
 pub mod auth;
 pub mod config;
 pub mod db;
@@ -14,5 +15,9 @@ pub mod tutoring;
 
 pub mod production;
 
+pub mod curriculum;
+pub mod learning_api;
 pub mod practice;
 pub mod practice_mvp;
+
+pub mod workflow;

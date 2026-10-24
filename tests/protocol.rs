@@ -78,7 +78,28 @@ async fn streamable_http_lists_and_calls_domain_tools() {
     let tools = listed["result"]["tools"]
         .as_array()
         .expect("tools should be an array");
-    assert_eq!(tools.len(), 13);
+    assert_eq!(tools.len(), 15);
+    for name in ["get_practice_brief", "validate_practice_plan"] {
+        let tool = tools.iter().find(|tool| tool["name"] == name).unwrap();
+        assert!(tool["inputSchema"]["properties"].get("exam_task").is_some());
+    }
+    let task_planner = tools
+        .iter()
+        .find(|tool| tool["name"] == "get_practice_brief")
+        .unwrap();
+    assert!(
+        task_planner["inputSchema"]["properties"]
+            .get("task_first")
+            .is_some()
+    );
+    for name in ["get_tutor_handoff", "record_tutor_feedback"] {
+        let tool = tools.iter().find(|tool| tool["name"] == name).unwrap();
+        assert!(
+            tool["inputSchema"]["properties"]
+                .get("handoff_id")
+                .is_some()
+        );
+    }
     assert_eq!(tools[0]["_meta"]["securitySchemes"][0]["type"], "noauth");
     let serialized = serde_json::to_string(tools).expect("tools should serialize");
     assert!(!serialized.contains("projectId"));
@@ -89,6 +110,16 @@ async fn streamable_http_lists_and_calls_domain_tools() {
         .find(|tool| tool["name"] == "record_practice_session")
         .expect("record tool should be listed");
     let input_schema = &record_tool["inputSchema"];
+    assert!(
+        input_schema["properties"]
+            .get("task_requirements")
+            .is_some()
+    );
+    assert!(
+        input_schema["properties"]
+            .get("requested_point_assessments")
+            .is_some()
+    );
     assert_eq!(
         input_schema["properties"]["items"]["items"]["type"],
         "object"
@@ -145,6 +176,16 @@ async fn streamable_http_lists_and_calls_domain_tools() {
             .contains("Preferred normal tutoring recorder")
     );
     let compact_schema = &compact_tool["inputSchema"];
+    assert!(
+        compact_schema["properties"]
+            .get("task_requirements")
+            .is_some()
+    );
+    assert!(
+        compact_schema["properties"]
+            .get("task_assessments")
+            .is_some()
+    );
     assert_eq!(compact_schema["properties"]["turns"]["maxItems"], 100);
     assert_eq!(
         compact_schema["$defs"]["TutoringTurnInput"]["properties"]["attempts"]["maxItems"],

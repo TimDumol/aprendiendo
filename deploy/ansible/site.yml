@@ -154,6 +154,60 @@
         group: '65532'
         mode: '0700'
 
+    - name: Validate the release against an isolated production database snapshot
+      when: production_database.stat.exists
+      block:
+        - name: Allocate private schema preflight directory
+          ansible.builtin.tempfile:
+            state: directory
+            prefix: aprendiendo-schema-check-
+          register: schema_preflight
+
+        - name: Snapshot SQLite consistently without changing production
+          ansible.builtin.command:
+            argv:
+              - python3
+              - -c
+              - >-
+                import sqlite3,sys;
+                source=sqlite3.connect('file:'+sys.argv[1]+'?mode=ro',uri=True);
+                source.backup(sqlite3.connect(sys.argv[2]))
+              - "{{ mcp_deploy_dir }}/app/data/aprendiendo.sqlite3"
+              - "{{ schema_preflight.path }}/check.sqlite3"
+          changed_when: false
+
+        - name: Restrict snapshot to the application UID
+          ansible.builtin.file:
+            path: "{{ schema_preflight.path }}"
+            owner: '65532'
+            group: '65532'
+            mode: '0700'
+            recurse: true
+
+        - name: Check migrations with the new image before replacing live services
+          ansible.builtin.command:
+            argv:
+              - docker
+              - run
+              - --rm
+              - --network=none
+              - --read-only
+              - --cap-drop=ALL
+              - --security-opt=no-new-privileges:true
+              - --user=65532:65532
+              - --volume
+              - "{{ schema_preflight.path }}:/data"
+              - --entrypoint=/usr/local/bin/migrate
+              - "{{ mcp_image }}"
+              - /data/check.sqlite3
+          changed_when: false
+      always:
+        - name: Remove private preflight snapshot
+          ansible.builtin.file:
+            path: "{{ schema_preflight.path }}"
+            state: absent
+          when: schema_preflight is defined and schema_preflight.path is defined
+
     - name: Write production environment
       ansible.builtin.copy:
         dest: "{{ mcp_deploy_dir }}/app/.env"

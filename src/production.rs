@@ -1,5 +1,5 @@
 //! Durable policy and conservative rule checks. Linguistic assessment remains tutor judgment.
-use crate::model::{DrillType, PracticeBriefRequest};
+use crate::model::{DrillType, ExamTask, PracticeBriefRequest};
 use anyhow::{Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 use schemars::JsonSchema;
@@ -41,6 +41,8 @@ pub struct CorrectionPolicy {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Preferences {
+    #[serde(default)]
+    pub learning_focus: LearningFocus,
     pub default_practice_mode: PracticeMode,
     pub excluded_drill_types: Vec<DrillType>,
     pub prompt_policy: PromptPolicy,
@@ -52,6 +54,8 @@ pub struct Preferences {
 #[serde(deny_unknown_fields)]
 pub struct PreferencePatch {
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub learning_focus: Option<LearningFocus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub default_practice_mode: Option<PracticeMode>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub excluded_drill_types: Option<Vec<DrillType>>,
@@ -61,6 +65,23 @@ pub struct PreferencePatch {
     pub written_round_budget: Option<WrittenRoundBudgetPatch>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub correction_policy: Option<CorrectionPolicyPatch>,
+}
+/// Replaced as a whole when edited. Dates remain in learner_goals.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LearningFocus {
+    pub skills: Vec<String>,
+    pub daily_minutes: Option<u16>,
+    pub exam_practice_percent: u8,
+}
+impl Default for LearningFocus {
+    fn default() -> Self {
+        Self {
+            skills: vec!["writing".into(), "speaking".into()],
+            daily_minutes: None,
+            exam_practice_percent: 80,
+        }
+    }
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -118,6 +139,7 @@ pub const DDL: &str = "CREATE TABLE IF NOT EXISTS practice_preferences (id INTEG
 
 pub fn defaults() -> Preferences {
     Preferences {
+        learning_focus: LearningFocus::default(),
         default_practice_mode: PracticeMode::Mixed,
         excluded_drill_types: Vec::new(),
         prompt_policy: PromptPolicy {
@@ -174,6 +196,27 @@ fn patched(p: Preferences, patch: &PreferencePatch) -> Result<Preferences> {
     let mut v = serde_json::to_value(p)?;
     merge(&mut v, serde_json::to_value(patch)?);
     let p: Preferences = serde_json::from_value(v)?;
+    if p.learning_focus.skills.is_empty()
+        || p.learning_focus.skills.len() > 4
+        || p.learning_focus
+            .skills
+            .iter()
+            .any(|s| !["writing", "speaking", "reading", "listening"].contains(&s.as_str()))
+        || p.learning_focus
+            .skills
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+            != p.learning_focus.skills.len()
+        || p.learning_focus
+            .daily_minutes
+            .is_some_and(|m| m == 0 || m > 240)
+        || p.learning_focus.exam_practice_percent > 100
+    {
+        bail!(
+            "invalid learning focus: unique skills, 1–240 minutes, and 0–100 exam percent required"
+        )
+    }
     if p.written_round_budget.minimum == 0
         || p.written_round_budget.maximum < p.written_round_budget.minimum
         || p.written_round_budget.maximum > 50
@@ -189,7 +232,7 @@ pub fn get(c: &Connection) -> Result<Value> {
     let row:Option<(u64,String,String,String)>=c.query_row("SELECT version,preferences_json,updated_at,source FROM practice_preferences WHERE id=1",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
     Ok(match row {
         Some((v, p, t, s)) => {
-            json!({"version":v,"preferences":serde_json::from_str::<Value>(&p)?,"updated_at":t,"source":s})
+            json!({"version":v,"preferences":serde_json::from_str::<Preferences>(&p)?,"updated_at":t,"source":s})
         }
         None => {
             json!({"version":0,"preferences":defaults(),"updated_at":null,"source":"system defaults"})
@@ -258,6 +301,34 @@ pub fn constrain(c: &Connection, r: &mut PracticeBriefRequest) -> Result<Value> 
     let mut resolved = resolve(c, r.practice_mode, r.session_overrides.as_ref())?;
     let p: Preferences = serde_json::from_value(resolved["effective_preferences"].clone())?;
     let spontaneous = p.default_practice_mode == PracticeMode::Spontaneous;
+    if let Some(task) = r.exam_task {
+        let constraints = crate::audit::exam_task_constraints(task.as_str())
+            .ok_or_else(|| anyhow::anyhow!("unsupported exam task {}", task.as_str()))?;
+        resolved["exam_task"] = constraints.clone();
+        resolved["exam_configuration"] = crate::audit::official_exam_config();
+        resolved["learner_goal"] = crate::audit::learner_goal(c)?;
+        match task {
+            ExamTask::WritingTask1 | ExamTask::WritingTask2 => {
+                r.count = Some(1);
+                r.allowed_drill_types = Some(vec![DrillType::MicroStory]);
+            }
+            ExamTask::FullWriting => {
+                r.count = Some(2);
+                r.allowed_drill_types = Some(vec![DrillType::MicroStory]);
+            }
+            ExamTask::OralTask1 | ExamTask::OralTask2 | ExamTask::OralTask3 => {
+                r.count = Some(1);
+                r.allowed_drill_types = Some(vec![DrillType::SituationalResponse]);
+            }
+            ExamTask::FullOral => {
+                r.count = Some(3);
+                r.allowed_drill_types = Some(vec![DrillType::SituationalResponse]);
+            }
+            ExamTask::Reading | ExamTask::Listening => {
+                resolved["modality_status"] = json!("unknown_until_task_source_is_recorded");
+            }
+        }
+    }
     let permitted = |d: &DrillType| {
         !p.excluded_drill_types.contains(d)
             && (!spontaneous
@@ -363,6 +434,9 @@ pub struct ValidatePlanRequest {
     #[serde(default)]
     pub preceding_context: Vec<String>,
     pub planned_initial_sentences: Option<u16>,
+    /// Optional official DELE task scope. Generic sentence budgets do not
+    /// reject an explicitly scoped exam writing task.
+    pub exam_task: Option<ExamTask>,
 }
 pub fn prompt_findings(prompt: &str, targets: &[String]) -> Vec<Value> {
     let lower = prompt.to_lowercase();
@@ -460,14 +534,35 @@ pub fn validate(c: &Connection, r: ValidatePlanRequest) -> Result<Value> {
             }
         }
     }
-    if r.planned_initial_sentences
-        .is_some_and(|n| n < p.written_round_budget.minimum || n > p.written_round_budget.maximum)
+    if r.exam_task.is_none()
+        && r.planned_initial_sentences.is_some_and(|n| {
+            n < p.written_round_budget.minimum || n > p.written_round_budget.maximum
+        })
     {
         checks.push(json!({"code":"impossible_budget","severity":"error","method":"rule"}));
     }
-    Ok(
-        json!({"status":if checks.is_empty(){"structural_checks_passed"}else{"revision_required"},"policy_version":r.policy_version,"validator_version":1,"checks":checks,"semantic_review":"required","semantic_review_checklist":["disguised transformation or nearly supplied answer","valid alternative wording accepted","unnecessary invention burden","scenario repetition","single acceptable answer"],"limits":"Rules do not prove independent cognition or verify what was delivered. Validate adaptive follow-ups individually."}),
-    )
+    let mut response = json!({"status":if checks.is_empty(){"structural_checks_passed"}else{"revision_required"},"policy_version":r.policy_version,"validator_version":1,"checks":checks,"semantic_review":"required","semantic_review_checklist":["disguised transformation or nearly supplied answer","valid alternative wording accepted","unnecessary invention burden","scenario repetition","single acceptable answer"],"limits":"Rules do not prove independent cognition or verify what was delivered. Validate adaptive follow-ups individually."});
+    if let Some(task) = r.exam_task {
+        response["exam_task"] = crate::audit::exam_task_constraints(task.as_str())
+            .unwrap_or_else(|| json!({"task_key":task.as_str(),"status":"unknown"}));
+        response["exam_constraint_scope"] = json!(
+            "official task constraints apply to this validation only; no official score is inferred"
+        );
+        response["permitted_exam_support"] = json!([
+            "task instructions",
+            "source message or photograph",
+            "learner-written preparation notes",
+            "shared preparation time"
+        ]);
+        response["exam_review_checklist"] = json!([
+            "requested points are explicit",
+            "task and full-test timers are distinct",
+            "task 3 is a responsive exchange linked to task 2",
+            "no feedback before completion in mock mode",
+            "no model answers before the first attempt"
+        ]);
+    }
+    Ok(response)
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]

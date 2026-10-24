@@ -413,7 +413,7 @@ fn feedback_schema() -> Value {
             },
             "improvements": {
                 "type": "array",
-                "maxItems": 2,
+                "maxItems": 3,
                 "items": finding_schema(),
             },
             "limitations": {
@@ -434,11 +434,13 @@ fn finding_schema() -> Value {
             "category": {"type": "string", "enum": ["language", "delivery", "intelligibility"]},
             "observation": {"type": "string", "minLength": 1, "maxLength": 800},
             "quote": nullable("string"),
+            "explanation": nullable("string"),
+            "hint": nullable("string"),
             "suggestion": nullable("string"),
             "start_seconds": nullable("number"),
             "end_seconds": nullable("number"),
         },
-        "required": ["category", "observation", "quote", "suggestion", "start_seconds", "end_seconds"],
+        "required": ["category", "observation", "quote", "explanation", "hint", "suggestion", "start_seconds", "end_seconds"],
     })
 }
 

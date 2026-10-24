@@ -2,14 +2,14 @@
 //! before the latest-schema DDL is considered, so opening a database can never
 //! turn a partially migrated database into an apparently current one.
 
-use crate::{activities, fsrs_adapter, taxonomy};
+use crate::{activities, audit, fsrs_adapter, taxonomy};
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{Connection, OptionalExtension, Transaction, params, types::ValueRef};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 
-const LATEST_VERSION: i64 = 12;
+const LATEST_VERSION: i64 = 14;
 const MIGRATIONS: &[(i64, &str, &str)] = &[
     (3, "003_baseline_snapshot", "aprendiendo-schema-3-snapshot"),
     (4, "004_taxonomy_graph", "aprendiendo-taxonomy-graph-v1"),
@@ -41,6 +41,12 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "aprendiendo-structured-feedback-findings-v1",
     ),
     (12, "012_task_references", "aprendiendo-task-references-v1"),
+    (
+        13,
+        "013_data_quality_audit",
+        "aprendiendo-data-quality-audit-v1",
+    ),
+    (14, "014_tutor_workflow", "aprendiendo-tutor-workflow-v1"),
 ];
 
 pub fn run(c: &mut Connection) -> Result<()> {
@@ -87,6 +93,8 @@ fn initialize_latest(c: &mut Connection) -> Result<()> {
     tx.execute_batch(include_str!("../sql/sqlite_schema.sql"))?;
     tx.execute_batch(crate::production::DDL)?;
     tx.execute_batch(FINDINGS_DDL)?;
+    audit::install(&tx)?;
+    tx.execute_batch(crate::workflow::DDL)?;
     seed_activity_types(&tx)?;
     seed_taxonomy(&tx)?;
     insert_default_scheduler(&tx)?;
@@ -94,8 +102,8 @@ fn initialize_latest(c: &mut Connection) -> Result<()> {
         record_version(&tx, version)?;
     }
     tx.execute(
-        "INSERT INTO schema_meta(key,value) VALUES('schema_version','12')
-         ON CONFLICT(key) DO UPDATE SET value='12'",
+        "INSERT INTO schema_meta(key,value) VALUES('schema_version','14')
+         ON CONFLICT(key) DO UPDATE SET value='14'",
         [],
     )?;
     tx.commit()?;
@@ -108,6 +116,8 @@ fn initialize_legacy_catalog(c: &mut Connection) -> Result<()> {
     tx.execute_batch(include_str!("../sql/sqlite_schema.sql"))?;
     tx.execute_batch(crate::production::DDL)?;
     tx.execute_batch(FINDINGS_DDL)?;
+    audit::install(&tx)?;
+    tx.execute_batch(crate::workflow::DDL)?;
     seed_activity_types(&tx)?;
     seed_taxonomy(&tx)?;
     insert_default_scheduler(&tx)?;
@@ -115,8 +125,8 @@ fn initialize_legacy_catalog(c: &mut Connection) -> Result<()> {
         record_version(&tx, version)?;
     }
     tx.execute(
-        "INSERT INTO schema_meta(key,value) VALUES('schema_version','12')
-         ON CONFLICT(key) DO UPDATE SET value='12'",
+        "INSERT INTO schema_meta(key,value) VALUES('schema_version','14')
+         ON CONFLICT(key) DO UPDATE SET value='14'",
         [],
     )?;
     tx.commit()?;
@@ -197,6 +207,8 @@ fn apply_migration(c: &mut Connection, version: i64) -> Result<()> {
         10 => tx.execute_batch(crate::production::DDL)?,
         11 => tx.execute_batch(FINDINGS_DDL)?,
         12 => migration_task_references(&tx)?,
+        13 => audit::install(&tx)?,
+        14 => tx.execute_batch(crate::workflow::DDL)?,
         9 => unreachable!("migration 9 uses the connection-level migration path"),
         _ => bail!("unsupported migration version {version}"),
     }
@@ -2001,7 +2013,7 @@ mod tests {
             c.query_row("SELECT count(*) FROM schema_migrations", [], |r| r
                 .get::<_, i64>(0))
                 .unwrap(),
-            10
+            MIGRATIONS.len() as i64
         );
         assert!(!table_exists(&c, "exercise_types").unwrap());
         assert_eq!(
@@ -2012,6 +2024,10 @@ mod tests {
                 "exercise_type_key",
                 "topic",
                 "task_ref",
+                "exercise_instance_id",
+                "stimulus_identity",
+                "source_event_id",
+                "revision",
                 "notes",
                 "created_at"
             ]

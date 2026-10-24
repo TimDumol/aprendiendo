@@ -1,6 +1,6 @@
 # Security review — 24 October 2026
 
-Scope: Aprendiendo's committed application and dependencies, production shared Caddy, Pocket ID, exposed listeners, and container isolation. Existing staged feature work was excluded using a separate release checkout.
+Scope: Aprendiendo's committed application and dependencies, production shared Caddy, Pocket ID, exposed listeners, and container isolation. A separate release checkout preserved the original staging area. The staged backend source was subsequently included as a required production-schema prerequisite; unrelated frontend and native app work was excluded.
 
 ## Findings and remediation
 
@@ -20,3 +20,7 @@ This is a targeted security review, not a penetration test or a guarantee that n
 ## Bootstrap repair
 
 The first release attempt exposed a legacy bootstrap assumption: Zeus uses Docker CE, while the playbook unconditionally installed Ubuntu's docker.io and docker-compose-v2. apt removed CE packages and then failed on the existing Compose plugin's file ownership conflict. Restored Docker CE/CLI/containerd.io and retained its Compose plugin. Bootstrap now checks installed packages, preserves CE, and refuses package removals when installing distro Docker on new hosts.
+
+## Production schema prerequisite
+
+The first application replacement failed closed because committed source supported schema 12, but production already had the exact registered audit/workflow migrations 13 and 14. Restored the previous app image immediately, retaining patched Caddy and Pocket ID. Included the existing staged backend source supporting those production migrations, plus its schema, task catalog, dependencies and tests, as a prerequisite. The original staging area remains untouched. No migration registry entries were removed or bypassed. Releases now run the new migration binary against a consistent, private server-side database snapshot before replacing services; the snapshot is removed afterward. No production database was downloaded.

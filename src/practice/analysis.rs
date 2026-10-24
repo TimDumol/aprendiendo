@@ -5,15 +5,18 @@ use symphonia::core::{
     audio::SampleBuffer, codecs::DecoderOptions, errors::Error as SymphoniaError,
     formats::FormatOptions, io::MediaSourceStream, meta::MetadataOptions, probe::Hint,
 };
+use wavekat_vad::{VoiceActivityDetector, backends::silero::SileroVad};
 
-pub const PROCESSOR_VERSION: &str = "deterministic-delivery-v1";
-pub const VAD_MODEL_VERSION: &str = "energy-v1; silero-evaluation-pending";
+pub const PROCESSOR_VERSION: &str = "silero-delivery-v1";
+pub const VAD_MODEL_VERSION: &str = "wavekat-vad-0.1.17; silero-v6.2.1";
 pub const SAMPLE_RATE_HZ: u32 = 16_000;
 pub const PROBABILITY_THRESHOLD: f32 = 0.5;
 pub const MINIMUM_SPEECH_MS: u32 = 150;
 pub const MINIMUM_SILENCE_MS: u32 = 200;
 pub const INTERNAL_PAUSE_MS: f64 = 500.0;
 pub const LONG_PAUSE_MS: f64 = 2_000.0;
+const VAD_FRAME_SAMPLES: usize = 512;
+const VAD_FRAME_DURATION_MS: u32 = 32;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SpeechInterval {
@@ -43,67 +46,62 @@ pub struct DeliveryMetrics {
     pub limitations: Vec<String>,
 }
 
-/// Analyze bounded mono PCM. This is intentionally a small deterministic
-/// contract while the pinned Silero ONNX spike is evaluated. It uses the same
-/// interval and pause definitions as the future VAD stage and marks the model
-/// provenance explicitly so the UI cannot present it as acoustic certainty.
+/// Analyze bounded mono PCM with the stateful Silero detector from wavekat-vad.
+///
+/// Silero requires sequential 512-sample frames at 16 kHz. Audio arriving at
+/// another rate is resampled for detection, while the reported duration keeps
+/// the caller's original timeline.
 pub fn analyze_pcm16le(samples: &[i16], sample_rate_hz: u32) -> DeliveryMetrics {
-    let sample_rate_hz = sample_rate_hz.max(1);
+    let source_sample_rate_hz = sample_rate_hz;
+    let sample_rate_hz = source_sample_rate_hz.max(1);
     let duration_seconds = samples.len() as f64 / sample_rate_hz as f64;
-    let frame_samples = ((sample_rate_hz as usize * 20) / 1_000).max(1);
-    let minimum_speech_frames =
-        ((MINIMUM_SPEECH_MS as usize * sample_rate_hz as usize) / 1_000 / frame_samples).max(1);
+    let vad_samples = if source_sample_rate_hz == 0 {
+        Vec::new()
+    } else if source_sample_rate_hz == SAMPLE_RATE_HZ {
+        samples.to_vec()
+    } else {
+        resample_linear(samples, source_sample_rate_hz, SAMPLE_RATE_HZ)
+    };
+    let (frames, detector_error) = match detect_speech_frames(&vad_samples) {
+        Ok(frames) => (frames, false),
+        Err(()) => (Vec::new(), true),
+    };
+    build_delivery_metrics(
+        sample_rate_hz,
+        duration_seconds,
+        vad_samples.len(),
+        &frames,
+        detector_error,
+    )
+}
+
+fn build_delivery_metrics(
+    sample_rate_hz: u32,
+    duration_seconds: f64,
+    vad_samples_len: usize,
+    frames: &[bool],
+    detector_error: bool,
+) -> DeliveryMetrics {
+    let minimum_speech_frames = (MINIMUM_SPEECH_MS.div_ceil(VAD_FRAME_DURATION_MS) as usize).max(1);
     let minimum_silence_frames =
-        ((MINIMUM_SILENCE_MS as usize * sample_rate_hz as usize) / 1_000 / frame_samples).max(1);
-
-    let frames = samples
-        .chunks(frame_samples)
-        .map(|frame| {
-            let peak = frame
-                .iter()
-                .map(|sample| i32::from(sample.unsigned_abs()))
-                .max()
-                .unwrap_or_default() as f64
-                / i16::MAX as f64;
-            let energy = (frame
-                .iter()
-                .map(|sample| {
-                    let normalized = f64::from(*sample) / f64::from(i16::MAX);
-                    normalized * normalized
-                })
-                .sum::<f64>()
-                / frame.len().max(1) as f64)
-                .sqrt();
-            // A bounded energy detector is deliberately conservative. It is
-            // not a language-independent definition of hesitation.
-            peak >= 0.035 || energy >= 0.012
-        })
-        .collect::<Vec<_>>();
-
-    let mut smoothed = frames.clone();
-    for index in 0..frames.len() {
-        let start = index.saturating_sub(1);
-        let end = (index + 2).min(frames.len());
-        let voiced = frames[start..end].iter().filter(|value| **value).count();
-        smoothed[index] = voiced >= 2;
-    }
+        (MINIMUM_SILENCE_MS.div_ceil(VAD_FRAME_DURATION_MS) as usize).max(1);
 
     let mut intervals = Vec::new();
     let mut frame_index = 0;
-    while frame_index < smoothed.len() {
-        if !smoothed[frame_index] {
+    while frame_index < frames.len() {
+        if !frames[frame_index] {
             frame_index += 1;
             continue;
         }
         let start = frame_index;
-        while frame_index < smoothed.len() && smoothed[frame_index] {
+        while frame_index < frames.len() && frames[frame_index] {
             frame_index += 1;
         }
         if frame_index - start >= minimum_speech_frames {
             intervals.push(SpeechInterval {
-                start_seconds: start as f64 * frame_samples as f64 / sample_rate_hz as f64,
-                end_seconds: (frame_index * frame_samples).min(samples.len()) as f64
-                    / sample_rate_hz as f64,
+                start_seconds: start as f64 * VAD_FRAME_SAMPLES as f64 / SAMPLE_RATE_HZ as f64,
+                end_seconds: (frame_index * VAD_FRAME_SAMPLES).min(vad_samples_len) as f64
+                    / SAMPLE_RATE_HZ as f64,
             });
         }
     }
@@ -115,7 +113,7 @@ pub fn analyze_pcm16le(samples: &[i16], sample_rate_hz: u32) -> DeliveryMetrics 
         if let Some(previous) = merged.last_mut() {
             let gap = interval.start_seconds - previous.end_seconds;
             let minimum_silence_seconds =
-                minimum_silence_frames as f64 * frame_samples as f64 / sample_rate_hz as f64;
+                minimum_silence_frames as f64 * VAD_FRAME_SAMPLES as f64 / SAMPLE_RATE_HZ as f64;
             if gap < minimum_silence_seconds {
                 previous.end_seconds = interval.end_seconds;
                 continue;
@@ -124,16 +122,12 @@ pub fn analyze_pcm16le(samples: &[i16], sample_rate_hz: u32) -> DeliveryMetrics 
         merged.push(interval);
     }
 
-    let speech_active_seconds = if merged.is_empty() {
-        None
-    } else {
-        Some(
-            merged
-                .iter()
-                .map(|interval| interval.end_seconds - interval.start_seconds)
-                .sum(),
-        )
-    };
+    let speech_active_seconds = (!merged.is_empty()).then(|| {
+        merged
+            .iter()
+            .map(|interval| interval.end_seconds - interval.start_seconds)
+            .sum()
+    });
     let response_span_seconds = merged
         .first()
         .zip(merged.last())
@@ -161,6 +155,20 @@ pub fn analyze_pcm16le(samples: &[i16], sample_rate_hz: u32) -> DeliveryMetrics 
         .filter(|span| *span > 0.0)
         .map(|span| gaps.len() as f64 / (span / 60.0));
 
+    let limitations = if detector_error {
+        vec![
+            "Silero VAD could not analyze this recording; delivery metrics are unavailable."
+                .to_owned(),
+        ]
+    } else if speech_active_seconds.is_none() {
+        vec!["No reliable speech detected by Silero VAD.".to_owned()]
+    } else {
+        vec![
+            "Detected pauses are non-speech intervals; the processor cannot distinguish thinking from breathing.".to_owned(),
+            "Quiet speech, noise, music, and other speakers can corrupt the intervals.".to_owned(),
+        ]
+    };
+
     DeliveryMetrics {
         processor_version: PROCESSOR_VERSION.to_owned(),
         model_version: VAD_MODEL_VERSION.to_owned(),
@@ -183,16 +191,20 @@ pub fn analyze_pcm16le(samples: &[i16], sample_rate_hz: u32) -> DeliveryMetrics 
         },
         longest_pause_seconds: gaps.iter().copied().reduce(f64::max),
         speech_intervals: merged,
-        limitations: if speech_active_seconds.is_none() {
-            vec!["No reliable speech detected by the bounded energy detector.".to_owned()]
-        } else {
-            vec![
-                "Detected pauses are non-speech intervals; the processor cannot distinguish thinking from breathing.".to_owned(),
-                "Quiet speech, noise, music, and other speakers can corrupt the intervals.".to_owned(),
-                "The initial release uses a deterministic detector while Silero VAD integration is evaluated.".to_owned(),
-            ]
-        },
+        limitations,
     }
+}
+
+fn detect_speech_frames(samples: &[i16]) -> Result<Vec<bool>, ()> {
+    let mut vad = SileroVad::new(SAMPLE_RATE_HZ).map_err(|_| ())?;
+    samples
+        .chunks_exact(VAD_FRAME_SAMPLES)
+        .map(|frame| {
+            vad.process(frame, SAMPLE_RATE_HZ)
+                .map(|probability| probability >= PROBABILITY_THRESHOLD)
+                .map_err(|_| ())
+        })
+        .collect()
 }
 
 fn median(values: &[f64]) -> f64 {
@@ -350,17 +362,18 @@ fn resample_linear(samples: &[i16], source_rate: u32, target_rate: u32) -> Vec<i
 mod tests {
     use super::*;
 
-    fn speech_with_gap() -> Vec<i16> {
-        let mut samples = Vec::new();
-        samples.extend(std::iter::repeat_n(8_000, SAMPLE_RATE_HZ as usize));
-        samples.extend(std::iter::repeat_n(0, SAMPLE_RATE_HZ as usize));
-        samples.extend(std::iter::repeat_n(8_000, SAMPLE_RATE_HZ as usize));
-        samples
-    }
-
     #[test]
     fn reports_pause_definitions_and_denominators() {
-        let result = analyze_pcm16le(&speech_with_gap(), SAMPLE_RATE_HZ);
+        let mut frames = vec![true; 31];
+        frames.extend(std::iter::repeat_n(false, 31));
+        frames.extend(std::iter::repeat_n(true, 31));
+        let result = build_delivery_metrics(
+            SAMPLE_RATE_HZ,
+            3.0,
+            SAMPLE_RATE_HZ as usize * 3,
+            &frames,
+            false,
+        );
         assert_eq!(result.internal_pause_count, Some(1));
         assert_eq!(result.long_pause_count, Some(0));
         assert!(result.pause_time_seconds.unwrap() >= 0.9);
@@ -374,6 +387,13 @@ mod tests {
         assert_eq!(result.response_span_seconds, None);
         assert_eq!(result.internal_pause_count, None);
         assert!(result.limitations[0].contains("No reliable speech"));
+    }
+
+    #[test]
+    fn reports_the_silero_wavekat_model_provenance() {
+        let result = build_delivery_metrics(SAMPLE_RATE_HZ, 0.0, 0, &[], false);
+        assert_eq!(result.processor_version, PROCESSOR_VERSION);
+        assert_eq!(result.model_version, VAD_MODEL_VERSION);
     }
 
     #[test]

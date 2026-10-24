@@ -10,6 +10,10 @@ CREATE TABLE IF NOT EXISTS sessions (
   )),
   topic TEXT,
   task_ref TEXT,
+  exercise_instance_id TEXT,
+  stimulus_identity TEXT,
+  source_event_id TEXT,
+  revision INTEGER NOT NULL DEFAULT 1 CHECK (revision >= 1),
   notes TEXT,
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
@@ -187,6 +191,10 @@ CREATE TABLE IF NOT EXISTS practice_items (
   outcome TEXT CHECK (outcome IS NULL OR outcome IN ('incorrect','partially_correct','correct','omitted')),
   activity_run_id INTEGER,
   item_phase TEXT NOT NULL DEFAULT 'initial' CHECK (item_phase IN ('initial','follow_up','complication')),
+  effective_status TEXT NOT NULL DEFAULT 'active' CHECK (effective_status IN ('active','retracted','disputed')),
+  revision INTEGER NOT NULL DEFAULT 1 CHECK (revision >= 1),
+  computed_word_count INTEGER CHECK (computed_word_count IS NULL OR computed_word_count >= 0),
+  word_counter_version TEXT,
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   UNIQUE(id, session_id), UNIQUE(session_id, item_no),
   FOREIGN KEY (activity_run_id, session_id)
@@ -264,6 +272,8 @@ CREATE TABLE IF NOT EXISTS session_findings (
   original TEXT NOT NULL,
   suggestion TEXT,
   note TEXT,
+  effective_status TEXT NOT NULL DEFAULT 'active' CHECK (effective_status IN ('active','retracted','disputed')),
+  revision INTEGER NOT NULL DEFAULT 1 CHECK (revision >= 1),
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   FOREIGN KEY (practice_item_id, session_id)
     REFERENCES practice_items(id, session_id) ON DELETE CASCADE,
@@ -289,6 +299,8 @@ CREATE TABLE IF NOT EXISTS observations (
   evidence_strength TEXT CHECK (evidence_strength IS NULL OR evidence_strength IN ('recognition','cued_production','controlled_production','spontaneous_production')),
   severity TEXT CHECK (severity IS NULL OR severity IN ('minor','meaning_affecting','blocking')),
   produced TEXT, correction TEXT, error_span TEXT, notes TEXT,
+  effective_status TEXT NOT NULL DEFAULT 'active' CHECK (effective_status IN ('active','retracted','disputed')),
+  revision INTEGER NOT NULL DEFAULT 1 CHECK (revision >= 1),
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   UNIQUE(session_id, observation_no),
   FOREIGN KEY (attempt_id, session_id) REFERENCES attempts(id, session_id) ON DELETE CASCADE,
@@ -335,6 +347,8 @@ CREATE TABLE IF NOT EXISTS weakness_reviews (
   stability_before REAL CHECK (stability_before IS NULL OR stability_before > 0), difficulty_before REAL CHECK (difficulty_before IS NULL OR (difficulty_before >= 1 AND difficulty_before <= 10)),
   stability_after REAL NOT NULL CHECK (stability_after > 0), difficulty_after REAL NOT NULL CHECK (difficulty_after >= 1 AND difficulty_after <= 10), scheduled_interval_days INTEGER NOT NULL CHECK (scheduled_interval_days >= 1),
   due_learning_day TEXT NOT NULL, algorithm TEXT NOT NULL, algorithm_version TEXT NOT NULL, parameter_set_id INTEGER NOT NULL REFERENCES scheduler_parameter_sets(id),
+  effective_status TEXT NOT NULL DEFAULT 'active' CHECK (effective_status IN ('active','invalidated','disputed')),
+  revision INTEGER NOT NULL DEFAULT 1 CHECK (revision >= 1),
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), UNIQUE(session_id, scheduler_item_id)
 );
 CREATE INDEX IF NOT EXISTS weakness_reviews_item_time_idx ON weakness_reviews(scheduler_item_id, reviewed_at);
@@ -366,3 +380,95 @@ CREATE INDEX IF NOT EXISTS practice_item_targets_weakness_idx ON practice_item_t
 CREATE INDEX IF NOT EXISTS prompt_fingerprint_created_idx ON practice_items(prompt_fingerprint, created_at);
 CREATE INDEX IF NOT EXISTS attempts_response_mode_session_idx ON attempts(response_mode, session_id);
 CREATE INDEX IF NOT EXISTS sessions_task_ref_idx ON sessions(task_ref, session_date DESC, id DESC);
+
+CREATE TABLE IF NOT EXISTS audit_runs (
+  audit_run_id TEXT PRIMARY KEY,
+  snapshot_boundary TEXT NOT NULL,
+  snapshot_hash TEXT NOT NULL,
+  model_id TEXT,
+  prompt_version TEXT,
+  scope_json TEXT NOT NULL DEFAULT '{}',
+  started_at TEXT NOT NULL,
+  ended_at TEXT,
+  status TEXT NOT NULL CHECK(status IN ('planned','running','completed','failed','partial')),
+  records_examined INTEGER NOT NULL DEFAULT 0 CHECK(records_examined >= 0),
+  proposed_count INTEGER NOT NULL DEFAULT 0 CHECK(proposed_count >= 0),
+  applied_count INTEGER NOT NULL DEFAULT 0 CHECK(applied_count >= 0),
+  rejected_count INTEGER NOT NULL DEFAULT 0 CHECK(rejected_count >= 0),
+  disputed_count INTEGER NOT NULL DEFAULT 0 CHECK(disputed_count >= 0),
+  failure_count INTEGER NOT NULL DEFAULT 0 CHECK(failure_count >= 0),
+  latest_successful_boundary TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE TABLE IF NOT EXISTS data_amendments (
+  audit_run_id TEXT NOT NULL REFERENCES audit_runs(audit_run_id),
+  proposal_id TEXT NOT NULL,
+  entity_type TEXT NOT NULL,
+  entity_id TEXT NOT NULL,
+  expected_revision INTEGER NOT NULL CHECK(expected_revision >= 1),
+  before_hash TEXT NOT NULL,
+  operation TEXT NOT NULL,
+  before_json TEXT NOT NULL CHECK(json_valid(before_json)),
+  after_json TEXT NOT NULL CHECK(json_valid(after_json)),
+  source_refs_json TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(source_refs_json)),
+  reason TEXT NOT NULL,
+  issue_class TEXT NOT NULL,
+  certainty TEXT NOT NULL CHECK(certainty IN ('supported','disputed','insufficient_evidence')),
+  reviewer TEXT NOT NULL,
+  prompt_version TEXT NOT NULL,
+  reviewed_at TEXT NOT NULL,
+  dependencies_json TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(dependencies_json)),
+  affected_consumers_json TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(affected_consumers_json)),
+  predecessor_revision INTEGER NOT NULL CHECK(predecessor_revision >= 1),
+  status TEXT NOT NULL CHECK(status IN ('proposed','applied','rejected','disputed','reverted')),
+  applied_at TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  error TEXT,
+  PRIMARY KEY(audit_run_id, proposal_id)
+);
+CREATE INDEX IF NOT EXISTS data_amendments_entity_idx ON data_amendments(entity_type, entity_id, created_at);
+CREATE INDEX IF NOT EXISTS data_amendments_run_status_idx ON data_amendments(audit_run_id, status);
+CREATE TABLE IF NOT EXISTS effective_summaries (
+  session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  summary_key TEXT NOT NULL,
+  summary_json TEXT NOT NULL CHECK(json_valid(summary_json)),
+  revision INTEGER NOT NULL CHECK(revision >= 1),
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY(session_id, summary_key)
+);
+CREATE TABLE IF NOT EXISTS learner_goals (
+  id INTEGER PRIMARY KEY CHECK(id=1), exam_key TEXT NOT NULL, target_date TEXT, oral_date TEXT,
+  timezone TEXT NOT NULL, source TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS exam_specifications (
+  exam_key TEXT NOT NULL, specification_version TEXT NOT NULL, source_url TEXT NOT NULL,
+  retrieved_at TEXT NOT NULL, config_json TEXT NOT NULL CHECK(json_valid(config_json) AND json_type(config_json)='object'),
+  PRIMARY KEY(exam_key, specification_version)
+);
+CREATE TABLE IF NOT EXISTS task_requirements (
+  id INTEGER PRIMARY KEY, session_id INTEGER REFERENCES sessions(id) ON DELETE CASCADE,
+  practice_item_id INTEGER, exam_key TEXT, specification_version TEXT, skill TEXT NOT NULL, task_key TEXT NOT NULL,
+  prompt_hash TEXT, requested_points_json TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(requested_points_json)),
+  word_min INTEGER CHECK(word_min IS NULL OR word_min >= 0), word_max INTEGER CHECK(word_max IS NULL OR word_max >= word_min),
+  time_budget_seconds INTEGER CHECK(time_budget_seconds IS NULL OR time_budget_seconds > 0),
+  preparation_budget_seconds INTEGER CHECK(preparation_budget_seconds IS NULL OR preparation_budget_seconds > 0),
+  source TEXT NOT NULL CHECK(source IN ('official','teacher_created','micropractice')),
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  FOREIGN KEY (practice_item_id, session_id) REFERENCES practice_items(id, session_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS task_requirements_item_idx ON task_requirements(practice_item_id, session_id);
+CREATE TABLE IF NOT EXISTS requested_point_assessments (
+  id INTEGER PRIMARY KEY, attempt_id INTEGER NOT NULL REFERENCES attempts(id) ON DELETE CASCADE,
+  point_key TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('met','partial','missing','unclear')),
+  supporting_excerpt TEXT, reason TEXT, evaluator TEXT NOT NULL, rubric_version TEXT, assessed_at TEXT NOT NULL,
+  retrospective INTEGER NOT NULL DEFAULT 0 CHECK(retrospective IN (0,1)), UNIQUE(attempt_id, point_key)
+);
+CREATE TABLE IF NOT EXISTS audit_checkpoints (
+  audit_run_id TEXT NOT NULL REFERENCES audit_runs(audit_run_id) ON DELETE CASCADE,
+  unit_key TEXT NOT NULL, source_hash TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('pending','completed','failed')),
+  error TEXT, updated_at TEXT NOT NULL, PRIMARY KEY(audit_run_id, unit_key)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS sessions_source_event_idx ON sessions(source_event_id) WHERE source_event_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS observations_effective_idx ON observations(effective_status, weakness_id, session_id);
+CREATE INDEX IF NOT EXISTS session_findings_effective_idx ON session_findings(effective_status, session_id, id);
+CREATE INDEX IF NOT EXISTS weakness_reviews_effective_idx ON weakness_reviews(effective_status, scheduler_item_id, reviewed_at);

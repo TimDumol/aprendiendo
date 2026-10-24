@@ -90,6 +90,7 @@ async fn main() -> Result<()> {
     // consumes queued jobs so the MCP process does not perform media decoding
     // or provider work inline.
     let practice_routes = practice::router(&config.database_path)?
+        .merge(aprendiendo_mcp::learning_api::router(store.clone()))
         .route_layer(middleware::from_fn_with_state(auth.clone(), require_auth));
 
     let auth_routes = Router::new()

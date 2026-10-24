@@ -35,6 +35,7 @@ chrono = { version = "0.4.42", default-features = false, features = ["clock", "s
 chrono-tz = "=0.10.4"
 symphonia = { version = "0.5.4", default-features = false, features = ["aac", "isomp4", "ogg", "vorbis", "wav", "pcm"] }
 image = { version = "0.25.8", default-features = false, features = ["jpeg", "png", "webp"] }
+wavekat-vad = { version = "0.1.17", default-features = false, features = ["silero"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

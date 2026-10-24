@@ -228,6 +228,8 @@ pub struct Finding {
     pub category: FindingCategory,
     pub observation: String,
     pub quote: Option<String>,
+    pub explanation: Option<String>,
+    pub hint: Option<String>,
     pub suggestion: Option<String>,
     pub start_seconds: Option<f64>,
     pub end_seconds: Option<f64>,
@@ -295,7 +297,7 @@ impl Feedback {
         if self.strengths.len() > 2 {
             return Err(FeedbackValidationError::TooManyFindings("strengths"));
         }
-        if self.improvements.len() > 2 {
+        if self.improvements.len() > 3 {
             return Err(FeedbackValidationError::TooManyFindings("improvements"));
         }
         if self.limitations.len() > 3 {
@@ -328,6 +330,16 @@ fn sanitize_finding(
     }
     if finding.observation.chars().count() > 800 {
         return Err(FeedbackValidationError::FieldTooLong("observation"));
+    }
+    if let Some(explanation) = &finding.explanation
+        && explanation.chars().count() > 800
+    {
+        return Err(FeedbackValidationError::FieldTooLong("explanation"));
+    }
+    if let Some(hint) = &finding.hint
+        && hint.chars().count() > 500
+    {
+        return Err(FeedbackValidationError::FieldTooLong("hint"));
     }
     if let Some(suggestion) = &finding.suggestion
         && suggestion.chars().count() > 800
@@ -796,6 +808,8 @@ mod tests {
             category: FindingCategory::Language,
             observation: "Observation".to_owned(),
             quote: Some("not in transcript".to_owned()),
+            explanation: None,
+            hint: None,
             suggestion: None,
             start_seconds: Some(20.0),
             end_seconds: Some(30.0),
