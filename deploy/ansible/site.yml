@@ -31,17 +31,32 @@
           use scripts/release.sh for the complete release flow.
 
   tasks:
+    - name: Inspect installed packages before choosing Docker distribution
+      ansible.builtin.package_facts:
+        manager: auto
+      tags:
+        - bootstrap
+
     - name: Install Docker Engine and Compose plugin prerequisites
       ansible.builtin.apt:
         name:
           - ca-certificates
           - curl
-          - docker.io
-          - docker-compose-v2
           - git
           - openssl
         state: present
         update_cache: true
+      tags:
+        - bootstrap
+
+    - name: Install distro Docker only when Docker CE is not installed
+      ansible.builtin.apt:
+        name:
+          - docker.io
+          - docker-compose-v2
+        state: present
+        fail_on_autoremove: true
+      when: "'docker-ce' not in ansible_facts.packages"
       tags:
         - bootstrap
 

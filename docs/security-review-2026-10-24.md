@@ -16,3 +16,7 @@ Scope: Aprendiendo's committed application and dependencies, production shared C
 Rust tests, advisory scan, shell syntax, TypeScript and web export are release checks. Verify the running Caddy version, identity container health/isolation, public health/readiness, OIDC discovery and unauthenticated MCP challenge after deployment. Only SSH and HTTP(S) are published; UFW is active for IPv4 and IPv6. Identity data/key ownership supports UID 1000. Existing encrypted shared-server backups remain in place.
 
 This is a targeted security review, not a penetration test or a guarantee that no vulnerabilities remain. Passkey login requires a browser/user interaction and is not exercised by discovery or health checks. npm's unresolved node-forge issue remains open. The web image is a local preview stack, not part of the production Rust release.
+
+## Bootstrap repair
+
+The first release attempt exposed a legacy bootstrap assumption: Zeus uses Docker CE, while the playbook unconditionally installed Ubuntu's docker.io and docker-compose-v2. apt removed CE packages and then failed on the existing Compose plugin's file ownership conflict. Restored Docker CE/CLI/containerd.io and retained its Compose plugin. Bootstrap now checks installed packages, preserves CE, and refuses package removals when installing distro Docker on new hosts.
